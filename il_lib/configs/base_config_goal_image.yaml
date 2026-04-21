@@ -1,0 +1,167 @@
+# Top-level training config for the ACT + goal-image baseline.
+#
+# Structurally mirrors ``base_config.yaml`` but swaps:
+#   - ``data.dataset_class`` for the goal-image aware subclass
+#   - ``policy_wrapper._target_`` for the goal-image aware wrapper
+#   - adds ``goal_view_name`` / ``goal_image_project_root`` knobs that are
+#     forwarded to the dataset / wrapper.
+#
+# Run with:
+#   python train.py --config-name base_config_goal_image \
+#       arch=act_goal task=<task> robot=r1pro data_dir=<path>
+defaults:
+  - _self_
+  - arch: ???
+  - task: ???
+  - robot: ???
+
+run_name: "${arch_name}_${task.name}"
+exp_root_dir: .
+arch_name: ???  # filled by arch
+headless: true
+
+# ====== Main Config ======
+seed: 42
+gpus: 1
+num_nodes: 1
+lr: 7e-4
+use_cosine_lr: true
+lr_warmup_steps: 1000
+lr_cosine_steps: 300000
+lr_cosine_min: 5e-6
+lr_layer_decay: 1.0
+wd: 0.0
+bs: 64
+vbs: ${bs}
+data_dir: ???
+eval_interval: 15
+online_eval: null
+
+horizon: ???
+num_latest_obs: ???
+deployed_action_steps: ???
+
+# ====== Action Keys ======
+action_key_dims: ???  # filled by robot
+
+# ====== Goal-image ======
+# View name used by the goal-image dataset and the eval policy wrapper. Must
+# match the corresponding entry in ``module.obs_backbone.views``.
+goal_view_name: robot_r1::goal::Camera:0
+# Resolve relative ``image_condition_path`` entries in parquet files.
+goal_image_project_root: ${data_dir}
+
+# Subset of ``robot.multi_view_cameras`` that this baseline actually loads
+# (head camera only). Overrides the robot-level default so the dataset and
+# eval wrapper don't decode wrist-camera videos we never feed to the policy.
+# Must stay consistent with ``module.obs_backbone.views`` in
+# ``arch/act_goal.yaml``.
+head_only_cameras:
+  head:
+    name: robot_r1::robot_r1:zed_link:Camera:0
+    resolution: [240, 240]
+
+# ====== Wandb ======
+use_wandb: true
+wandb_project: B1K
+wandb_group: ${arch_name}
+wandb_run_name: ${run_name}
+progress_bar_refresh_rate: 200
+
+# ====== Policy Module ======
+module:
+  _target_: ???  # filled by arch
+  online_eval: ${online_eval}
+  policy_wrapper: ${policy_wrapper}
+  robot_type: ${robot.type}
+  lr: ${lr}
+  use_cosine_lr: ${use_cosine_lr}
+  lr_warmup_steps: ${lr_warmup_steps}
+  lr_cosine_steps: ${lr_cosine_steps}
+  lr_cosine_min: ${lr_cosine_min}
+  lr_layer_decay: ${lr_layer_decay}
+  weight_decay: ${wd}
+  action_keys: ${action_keys}
+
+# ====== Data Module ======
+# Reuses ``BehaviorDataModule`` verbatim; the only change from base_config is
+# the dataset class string and the two extra kwargs that flow through the
+# data module's ``**kwargs`` into the dataset.
+data:
+  _target_: il_lib.datas.BehaviorDataModule
+  data_path: ${data_dir}
+  task_name:
+    - ${task.name}
+  batch_size: ${bs}
+  val_batch_size: ${vbs}
+  val_split_ratio: 0.1
+  dataloader_num_workers: 4
+  max_num_demos: null
+  seed: ${seed}
+  dataset_class: il_lib.datas.BehaviorIterableDatasetWithGoalImage
+  robot_type: ${robot.type}
+  obs_window_size: ${num_latest_obs}
+  ctx_len: ${horizon}
+  downsample_factor: 3  # downsample to 10Hz
+  use_task_info: false
+  task_info_range: ${task.task_info_range}
+  multi_view_cameras: ${head_only_cameras}
+  goal_view_name: ${goal_view_name}
+  project_root: ${goal_image_project_root}
+
+# ====== Trainer ======
+trainer:
+  accelerator: "gpu"
+  devices: ${gpus}
+  num_nodes: ${num_nodes}
+  precision: 32
+  strategy:
+    _target_: pytorch_lightning.strategies.DDPStrategy
+    timeout:
+      _target_: datetime.timedelta
+      seconds: 3600
+  benchmark: true
+  accumulate_grad_batches: 1
+  num_sanity_val_steps: 1
+  max_epochs: 999999999
+  val_check_interval: null
+  check_val_every_n_epoch: ${eval_interval}
+  gradient_clip_val: 1.0
+  fast_dev_run: false
+  checkpoint:
+  - filename: "epoch{epoch}-train_loss{train/loss:.5f}"
+    save_on_train_epoch_end: true
+    save_top_k: 10
+    save_last: true
+    monitor: "train/loss"
+    mode: min
+    auto_insert_metric_name: false
+  - filename: "epoch{epoch}-val_l1_{val/l1:.5f}"
+    save_top_k: -1
+    save_last: true
+    monitor: "val/l1"
+    mode: min
+    auto_insert_metric_name: false
+  callbacks:
+    - _target_: pytorch_lightning.callbacks.LearningRateMonitor
+      logging_interval: step
+    - _target_: pytorch_lightning.callbacks.RichModelSummary
+    - _target_: il_lib.training.trainer.CustomProgressBar
+      refresh_rate: ${progress_bar_refresh_rate}
+
+# ====== Policy Wrapper (online eval) ======
+policy_wrapper:
+  _target_: il_lib.policies.policy_base_goal_image.PolicyWrapperWithGoalImage
+  deployed_action_steps: ${deployed_action_steps}
+  obs_window_size: ${num_latest_obs}
+  multi_view_cameras: ${head_only_cameras}
+  visual_obs_types: ${data.visual_obs_types}
+  use_task_info: ${data.use_task_info}
+  task_info_range: ${task.task_info_range}
+  pcd_range: ${task.pcd_range}
+  robot_type: ${robot.type}
+  goal_view_name: ${goal_view_name}
+  # Override via CLI or env var ``ACT_GOAL_IMAGE_PATH``.
+  goal_image_path: null
+
+ckpt_path: null
