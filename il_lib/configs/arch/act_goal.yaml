@@ -55,7 +55,7 @@ module:
     use_shared_backbone: true
     load_pretrained: true
     include_depth: false
-    enable_random_crop: true
+    enable_random_crop: false # match gcbc --no-augment
     random_crop_size: 224
     return_last_spatial_map: true
   pos_encoding:

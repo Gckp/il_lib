@@ -21,19 +21,32 @@ arch_name: ???  # filled by arch
 headless: true
 
 # ====== Main Config ======
+# Experimental design (see README "Train"):
+# - **Match GCBC for fairness:** same train/val split (data), same gradient
+#   budget (``trainer.max_steps``), same log / val / checkpoint cadence,
+#   same augmentation policy as GCBC ``--no_augment``, same WandB project for
+#   comparable curves, same inputs (head RGB + goal + proprio) and il_lib
+#   action semantics.
+# - **Keep ACT / ``il_lib`` defaults where method-specific:** learning rate,
+#   batch size, weight decay, cosine horizon, chunk horizon, transformer and
+#   CVAE hyperparameters live in ``arch/act_goal.yaml`` (mirrors ``act.yaml``).
+#   Override on CLI for ablations (e.g. ``lr=3e-4 bs=256`` to match GCBC SGD
+#   recipe without claiming that is the canonical ACT baseline).
 seed: 42
 gpus: 1
 num_nodes: 1
 lr: 7e-4
 use_cosine_lr: true
 lr_warmup_steps: 1000
-lr_cosine_steps: 300000
+# Anneal cosine LR over the same step budget as ``trainer.max_steps``.
+lr_cosine_steps: 100000
 lr_cosine_min: 5e-6
 lr_layer_decay: 1.0
 wd: 0.0
-bs: 64
+bs: 128
 vbs: ${bs}
 data_dir: ???
+# Legacy epoch-based val (unused when ``trainer.val_check_interval`` is set).
 eval_interval: 15
 online_eval: null
 
@@ -63,7 +76,7 @@ head_only_cameras:
 
 # ====== Wandb ======
 use_wandb: true
-wandb_project: B1K
+wandb_project: ispatialgym-gcbc-torch
 wandb_group: ${arch_name}
 wandb_run_name: ${run_name}
 progress_bar_refresh_rate: 200
@@ -110,6 +123,9 @@ data:
   project_root: ${goal_image_project_root}
 
 # ====== Trainer ======
+# Step-based schedule matched to GCBC torch bookkeeping: 100k gradient steps,
+# log every 1000 steps, validation + checkpoints every 2000 steps (same as
+# ``--num_steps`` / ``--log_interval`` / ``--eval_interval`` / ``--save_interval``).
 trainer:
   accelerator: "gpu"
   devices: ${gpus}
@@ -124,19 +140,24 @@ trainer:
   accumulate_grad_batches: 1
   num_sanity_val_steps: 1
   max_epochs: 999999999
-  val_check_interval: null
-  check_val_every_n_epoch: ${eval_interval}
+  max_steps: 100000
+  log_every_n_steps: 1000
+  val_check_interval: 2000
+  check_val_every_n_epoch: null
   gradient_clip_val: 1.0
   fast_dev_run: false
   checkpoint:
-  - filename: "epoch{epoch}-train_loss{train/loss:.5f}"
-    save_on_train_epoch_end: true
+  - filename: "step{step}-train_loss{train/loss:.5f}"
+    every_n_train_steps: 2000
+    save_on_train_epoch_end: false
     save_top_k: 10
     save_last: true
     monitor: "train/loss"
     mode: min
     auto_insert_metric_name: false
-  - filename: "epoch{epoch}-val_l1_{val/l1:.5f}"
+  - filename: "step{step}-val_l1_{val/l1:.5f}"
+    every_n_train_steps: 2000
+    save_on_train_epoch_end: false
     save_top_k: -1
     save_last: true
     monitor: "val/l1"
