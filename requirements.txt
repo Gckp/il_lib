@@ -4,6 +4,11 @@ einops
 hydra-core
 numpy
 omegaconf
+av
+h5py
+opencv-python
+pandas
+pyarrow
 pytorch-lightning
 transformers
 wandb

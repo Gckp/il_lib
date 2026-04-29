@@ -133,18 +133,20 @@ script recognises both.
 python train.py \
     --config-name base_config_goal_image \
     arch=act_goal \
-    task=<task_name> \
+    task=behavior task.name=<task_name> \
     robot=r1pro \
     data_dir=/abs/path/to/act-goal-v1 \
     goal_image_project_root=/abs/path/to/behavior-1k-private
 ```
 
-`<task_name>` is the **string name** of the task, not the numeric ID. The
-allowed values are the keys of `TASK_NAMES_TO_INDICES` in
+`task` selects the Hydra task-group template (`behavior`), and `task.name`
+selects the specific benchmark task instance (for example,
+`camera_relocalization`). Allowed
+`task.name` values are the keys of `TASK_NAMES_TO_INDICES` in
 `OmniGibson/omnigibson/learning/utils/eval_utils.py` (`task_id = 0..54`):
 `turning_on_radio`, `picking_up_trash`, …, `camera_relocalization` (51),
 `path_integration` (52), `object_scaling` (53), `mental_rotation` (54).
-Hydra resolves this against `il_lib/configs/task/<task_name>.yaml`.
+Hydra resolves this against `il_lib/configs/task/behavior.yaml`.
 
 - `data_dir` points at the directory produced by `prepare_data.py` (the one
   that contains `2025-challenge-demos/...`).
@@ -164,12 +166,16 @@ temporal ensemble follow `il_lib`’s ACT defaults (not GCBC’s `3e-4` / 256). 
 optional “same optimizer hyperparams as GCBC” ablation, run with e.g.
 `lr=3e-4 bs=256` on the CLI. Slurm example: `scripts/train_act_goal.sh`.
 
+**Python 3.14+:** `train.py` applies a small argparse workaround so Hydra 1.3.x
+starts under CPython 3.14 ([hydra#3121](https://github.com/facebookresearch/hydra/issues/3121)).
+Python 3.10–3.13 remains the most battle-tested choice for the full stack.
+
 Smoke test:
 
 ```bash
 python train.py \
     --config-name base_config_goal_image \
-    arch=act_goal task=camera_relocalization robot=r1pro \
+    arch=act_goal task=behavior task.name=camera_relocalization robot=r1pro \
     data_dir=/abs/path/to/act-goal-v1 \
     goal_image_project_root=/abs/path/to/behavior-1k-private \
     trainer.fast_dev_run=true bs=2 use_wandb=false
