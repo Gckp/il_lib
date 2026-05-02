@@ -346,6 +346,10 @@ class PolicyWrapper:
         if "pcd" in self.visual_obs_types:
             pcd_obs = dict()
         for camera_id, camera in ROBOT_CAMERA_NAMES[self.robot_type].items():
+            # ``multi_view_cameras`` may be a subset (e.g. head-only ACT+goal training);
+            # skip cameras the policy was never trained on even if sim still emits them.
+            if camera_id not in self.obs_output_size:
+                continue
             if "rgb" in self.visual_obs_types or "pcd" in self.visual_obs_types:
                 rgb_obs = F.interpolate(
                     obs[f"{camera}::rgb"][..., :3].unsqueeze(0).movedim(-1, -3).to(torch.float32),

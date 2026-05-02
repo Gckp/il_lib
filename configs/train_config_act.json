@@ -1,0 +1,6 @@
+{
+  "policy": "il_lib_act",
+  "use_proprio": false,
+  "add_eef_proprio": false,
+  "normalize_proprio": false
+}
