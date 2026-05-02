@@ -26,6 +26,7 @@ module:
     - eef/right_quat
   action_dim: 23
   action_keys: ${robot.action_keys}
+  use_proprio: true
   features: [proprioception, rgbd]
   obs_backbone:
     _target_: il_lib.nn.features.MultiviewResNet18

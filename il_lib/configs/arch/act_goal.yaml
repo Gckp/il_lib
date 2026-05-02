@@ -37,6 +37,9 @@ module:
     - eef/right_quat
   action_dim: 23
   action_keys: ${robot.action_keys}
+  # Set false for vision-only (ResNet views + latent; proprio replaced with
+  # zeros and proprio MLPs frozen). Override: ``module.use_proprio=false``.
+  use_proprio: true
   # RGB-only: goal image is a single PNG per demo with no depth channel,
   # so we run every view through a 3-channel ResNet18. ACT.process_data
   # routes every ``obs`` key containing "rgb" into the multi-view backbone.

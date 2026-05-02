@@ -11,6 +11,7 @@ from il_lib.nn.transformers import (
 )
 from il_lib.policies.policy_base import BasePolicy
 from il_lib.utils.array_tensor_utils import any_concat, get_batch_size
+from il_lib.utils.training_utils import freeze_params
 from omegaconf import DictConfig
 from omnigibson.learning.utils.obs_utils import MAX_DEPTH, MIN_DEPTH
 from torch.autograd import Variable
@@ -44,6 +45,9 @@ class ACT(BasePolicy):
         pre_norm: bool,
         kl_weight: float,
         temporal_ensemble: bool,
+        # If False, proprio is replaced with zeros in forward (vision-only); the
+        # proprio linear layers are frozen and omitted from the optimizer.
+        use_proprio: bool = True,
         # ====== learning ======
         lr: float,
         use_cosine_lr: bool = False,
@@ -52,6 +56,7 @@ class ACT(BasePolicy):
         lr_cosine_min: Optional[float] = None,
         lr_layer_decay: float = 1.0,
         weight_decay: float = 0.0,
+        freeze_obs_backbone: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -61,6 +66,8 @@ class ACT(BasePolicy):
         self._features = features
         self._use_depth = obs_backbone.include_depth
         self.obs_backbone = instantiate(obs_backbone)
+        if freeze_obs_backbone:
+            freeze_params(self.obs_backbone)
 
         self.transformer = Transformer(
             d_model=hidden_dim,
@@ -116,6 +123,10 @@ class ACT(BasePolicy):
         self.lr_cosine_min = lr_cosine_min
         self.lr_layer_decay = lr_layer_decay
         self.weight_decay = weight_decay
+        self._use_proprio = use_proprio
+        if not use_proprio:
+            freeze_params(self.input_proj_robot_state)
+            freeze_params(self.encoder_prop_proj)
         # Save hyperparameters
         self.save_hyperparameters()
 
@@ -133,6 +144,8 @@ class ACT(BasePolicy):
         prop_obs = torch.cat(prop_obs, dim=-1)  # (B, L, Prop_dim)
         # flatten first two dims
         prop_obs = prop_obs.reshape(-1, prop_obs.shape[-1])  # (B * L, Prop_dim)
+        if not self._use_proprio:
+            prop_obs = torch.zeros_like(prop_obs)
 
         if is_training:
             # project action sequence to embedding dim, and concat with a CLS token
