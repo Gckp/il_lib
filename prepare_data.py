@@ -302,9 +302,11 @@ def resolve_splits(
 
         missing = [r["new_key"] for r in records if r["new_key"] not in key_to_split]
         if missing:
-            raise ValueError(
-                f"{len(missing)} episodes are not present in --split_json: "
-                f"first few = {missing[:5]}"
+            print(
+                f"[warn] {len(missing)} discovered episode(s) have no matching "
+                f"entry in --split_json (new_key form). They will be omitted from "
+                f"the prepared output. First few new_key values: {missing[:5]}",
+                file=sys.stderr,
             )
         if unknown:
             print(
@@ -469,7 +471,9 @@ def main() -> int:
     # Split args.
     p.add_argument("--split_json", type=str, default=None,
                    help='JSON {"train": [...], "val": [...], "test": [...]} '
-                        "keyed by original OR new 8-digit episode IDs.")
+                        "keyed by original OR new 8-digit episode IDs. "
+                        "Discovered episodes not listed in any split are omitted "
+                        "(logged); split entries with no matching demo are ignored.")
     p.add_argument("--train_ratio", type=float, default=0.8)
     p.add_argument("--val_ratio", type=float, default=0.1)
     p.add_argument("--test_ratio", type=float, default=0.1)
@@ -514,6 +518,23 @@ def main() -> int:
 
     # 3. Split.
     split_map = resolve_splits(records, args)
+    if args.split_json:
+        n_before = len(records)
+        records = [r for r in records if r["new_key"] in split_map]
+        n_omitted = n_before - len(records)
+        if n_omitted:
+            print(
+                f"[info] After intersecting with --split_json: preparing "
+                f"{len(records)} episode(s), omitted {n_omitted}."
+            )
+        if not records:
+            print(
+                "[error] No episodes remain after matching discovery to "
+                "--split_json. Check split keys (source episode id or new_key) "
+                "and that split_json lists the episodes you expect.",
+                file=sys.stderr,
+            )
+            return 1
 
     # 4. Place files.
     test_meta: Dict[str, Dict[str, str]] = {}
