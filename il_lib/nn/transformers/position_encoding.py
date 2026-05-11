@@ -1,33 +1,19 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 """
 Various positional encodings for the transformer.
+
+ACT convention (followed by both ``PositionEmbeddingSine`` and
+``PositionEmbeddingLearned`` below):
+    * forward receives a raw feature tensor of shape ``(B, C, H, W)``
+    * forward returns a positional encoding of shape ``(1, hidden_dim, H, W)``
+The batch broadcast is handled downstream in ``transformer.py`` via
+``pos_embed.flatten(2).permute(2, 0, 1).repeat(1, bs, 1)``, which assumes
+the leading batch dim of ``pos_embed`` is 1. The original DETR
+``NestedTensor`` wrapper is intentionally not used here.
 """
 import math
 import torch
 import torch.nn as nn
-from typing import Optional
-
-
-class NestedTensor(object):
-    def __init__(self, tensors, mask: Optional[torch.Tensor]):
-        self.tensors = tensors
-        self.mask = mask
-
-    def to(self, device):
-        cast_tensor = self.tensors.to(device)
-        mask = self.mask
-        if mask is not None:
-            assert mask is not None
-            cast_mask = mask.to(device)
-        else:
-            cast_mask = None
-        return NestedTensor(cast_tensor, cast_mask)
-
-    def decompose(self):
-        return self.tensors, self.mask
-
-    def __repr__(self):
-        return str(self.tensors)
 
 
 class PositionEmbeddingSine(nn.Module):
@@ -48,10 +34,8 @@ class PositionEmbeddingSine(nn.Module):
 
     def forward(self, tensor):
         x = tensor
-        # mask = tensor_list.mask
-        # assert mask is not None
-        # not_mask = ~mask
-
+        # No padding mask: ACT feeds dense feature maps (no NestedTensor), so
+        # ``not_mask`` is just ones the same H,W as ``x``.
         not_mask = torch.ones_like(x[0, [0]])
         y_embed = not_mask.cumsum(1, dtype=torch.float32)
         x_embed = not_mask.cumsum(2, dtype=torch.float32)
@@ -74,6 +58,14 @@ class PositionEmbeddingSine(nn.Module):
 class PositionEmbeddingLearned(nn.Module):
     """
     Absolute pos embedding, learned.
+
+    Adapted from the original DETR module to follow the ACT convention:
+        * accepts a raw ``(B, C, H, W)`` feature tensor (not a ``NestedTensor``)
+        * returns shape ``(1, 2 * num_pos_feats, H, W)`` so that the batch
+          broadcast performed by ``transformer.py`` via ``.repeat(1, bs, 1)``
+          on the flattened pos embed yields the correct ``(H*W, B, C)``
+          shape. Returning ``(B, ...)`` here would compound with that
+          ``repeat`` and silently produce ``(H*W, B*B, C)``.
     """
     def __init__(self, num_pos_feats=256):
         super().__init__()
@@ -85,8 +77,8 @@ class PositionEmbeddingLearned(nn.Module):
         nn.init.uniform_(self.row_embed.weight)
         nn.init.uniform_(self.col_embed.weight)
 
-    def forward(self, tensor_list: NestedTensor):
-        x = tensor_list.tensors
+    def forward(self, tensor):
+        x = tensor
         h, w = x.shape[-2:]
         i = torch.arange(w, device=x.device)
         j = torch.arange(h, device=x.device)
@@ -95,7 +87,7 @@ class PositionEmbeddingLearned(nn.Module):
         pos = torch.cat([
             x_emb.unsqueeze(0).repeat(h, 1, 1),
             y_emb.unsqueeze(1).repeat(1, w, 1),
-        ], dim=-1).permute(2, 0, 1).unsqueeze(0).repeat(x.shape[0], 1, 1, 1)
+        ], dim=-1).permute(2, 0, 1).unsqueeze(0)
         return pos
 
         
