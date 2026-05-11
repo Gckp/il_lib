@@ -69,9 +69,26 @@ class MultiviewResNet18(nn.Module):
             self._output_fc = nn.Linear(len(views) * resnet_output_dim, token_dim)
             self.output_dim = token_dim
 
+        # ``transforms.RandomCrop`` samples *one* (top, left) per forward call
+        # (see ``RandomCrop.get_params``: ``torch.randint(...).item()``), which
+        # means a batched ``(N, C, H, W)`` input gets a single shared crop
+        # across all N items -- effectively making the augmentation a no-op
+        # within a minibatch. We therefore handle random cropping ourselves in
+        # ``forward`` on the pre-flatten ``(B, L, C, H, W)`` tensor, sampling
+        # one offset per sample (shared across L frames to preserve temporal
+        # coherence). ``CenterCrop`` for eval is deterministic and stays in
+        # the torchvision pipeline.
+        self._enable_random_crop = enable_random_crop
+        if enable_random_crop:
+            if isinstance(random_crop_size, int):
+                self._random_crop_size = (random_crop_size, random_crop_size)
+            else:
+                self._random_crop_size = tuple(random_crop_size)
+        else:
+            self._random_crop_size = None
+
         train_transforms, eval_transforms = [], []
         if enable_random_crop:
-            train_transforms.append(transforms.RandomCrop(random_crop_size))
             eval_transforms.append(transforms.CenterCrop(random_crop_size))
         if include_depth:
             # We do not normalize depth
@@ -97,12 +114,47 @@ class MultiviewResNet18(nn.Module):
         """
         return list(self._views)
 
+    def _batched_random_crop(self, v: torch.Tensor) -> torch.Tensor:
+        """Per-sample random crop on a ``(B, L, C, H, W)`` tensor.
+
+        Samples one ``(top, left)`` offset per sample (B), shared across the
+        L frame dim and the C channel dim. Returns a tensor of shape
+        ``(B, L, C, crop_h, crop_w)``. Implemented with advanced indexing so
+        the whole batch is cropped in a single (GPU-friendly) gather.
+
+        Sharing the crop across L preserves temporal coherence within a
+        sample (consecutive frames don't visually "jitter" from frame to
+        frame), which matters for sequence policies (bcrnn, diffusion). For
+        ACT, ``num_latest_obs=1`` so L=1 and the choice is moot.
+        """
+        B, L, C, H, W = v.shape
+        crop_h, crop_w = self._random_crop_size
+        tops = torch.randint(0, H - crop_h + 1, (B,), device=v.device)
+        lefts = torch.randint(0, W - crop_w + 1, (B,), device=v.device)
+        # Build broadcasted index tensors so out[b,l,c,i,j] == v[b,l,c,top[b]+i,left[b]+j].
+        b_idx = torch.arange(B, device=v.device).view(B, 1, 1, 1, 1)
+        l_idx = torch.arange(L, device=v.device).view(1, L, 1, 1, 1)
+        c_idx = torch.arange(C, device=v.device).view(1, 1, C, 1, 1)
+        h_idx = (
+            tops.view(B, 1) + torch.arange(crop_h, device=v.device).view(1, crop_h)
+        ).view(B, 1, 1, crop_h, 1)
+        w_idx = (
+            lefts.view(B, 1) + torch.arange(crop_w, device=v.device).view(1, crop_w)
+        ).view(B, 1, 1, 1, crop_w)
+        return v[b_idx, l_idx, c_idx, h_idx, w_idx]
+
     def forward(self, x):
         """
         x: a dict with keys in self._views and values of shape (B, L, C, H, W)
         """
         assert set(x.keys()) == set(self._views)
         B, L = x[self._views[0]].shape[:2]
+        if self.training and self._enable_random_crop:
+            # Random crop is applied per-camera (independent offsets across
+            # cameras), per-sample (independent offsets across B), and shared
+            # across L. See ``_batched_random_crop`` for rationale. Done
+            # *before* the flatten so we can broadcast the offset over L.
+            x = {k: self._batched_random_crop(v) for k, v in x.items()}
         x = {
             k: rearrange(v, "B L C H W -> (B L) C H W").contiguous()
             for k, v in x.items()
