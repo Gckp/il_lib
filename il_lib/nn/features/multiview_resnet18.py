@@ -7,6 +7,7 @@ from il_lib.utils.array_tensor_utils import any_concat
 from il_lib.utils.training_utils import load_state_dict
 from il_lib.optim import default_optimizer_groups
 import il_lib.nn.features.resnet as resnet_lib
+from il_lib.nn.features.resnet import FrozenBatchNorm2d
 from torchvision import transforms
 from torchvision.models import ResNet18_Weights
 from typing import List, Optional, Union
@@ -24,16 +25,28 @@ class MultiviewResNet18(nn.Module):
         include_depth: bool = False,
         enable_random_crop: bool = True,
         random_crop_size: Optional[Union[int, List[int]]] = None,
-        return_last_spatial_map: bool = False
+        return_last_spatial_map: bool = False,
+        # Replace BN with FrozenBatchNorm2d (DETR / ACT convention). Required
+        # for ACT-style training where the head LR is high and the per-camera
+        # effective batch is small: with vanilla BN, running stats and affine
+        # params drift quickly and the pretrained features get destroyed,
+        # which empirically makes the policy ignore vision.
+        use_frozen_batch_norm: bool = False,
     ):
         super().__init__()
         self._views = views
         self._use_shared_backbone = use_shared_backbone
+        resnet_kwargs = dict(
+            output_dim=resnet_output_dim,
+            return_last_spatial_map=return_last_spatial_map,
+        )
+        if use_frozen_batch_norm:
+            resnet_kwargs["norm_layer"] = FrozenBatchNorm2d
         if use_shared_backbone:
-            self._resnet = getattr(resnet_lib, backbone)(output_dim=resnet_output_dim, return_last_spatial_map=return_last_spatial_map)
+            self._resnet = getattr(resnet_lib, backbone)(**resnet_kwargs)
         else:
             self._resnet = nn.ModuleDict({
-                view: getattr(resnet_lib, backbone)(output_dim=resnet_output_dim, return_last_spatial_map=return_last_spatial_map)
+                view: getattr(resnet_lib, backbone)(**resnet_kwargs)
                 for view in views
             })
         if load_pretrained:

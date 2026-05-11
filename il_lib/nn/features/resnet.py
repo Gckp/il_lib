@@ -7,7 +7,74 @@ from il_lib.utils.config_utils import register_class
 from typing import Callable, List, Optional, Type, Union
 
 
-__all__ = ["create_resnet", "get_resnet_class", "get_all_resnet_names"]
+__all__ = [
+    "create_resnet",
+    "get_resnet_class",
+    "get_all_resnet_names",
+    "FrozenBatchNorm2d",
+]
+
+
+class FrozenBatchNorm2d(torch.nn.Module):
+    """
+    BatchNorm2d where the batch statistics and the affine parameters are fixed.
+
+    Affine params (``weight``, ``bias``) and running stats (``running_mean``,
+    ``running_var``) are registered as buffers, so they are never updated by
+    the optimizer nor by BN's running-statistics update during ``forward``.
+
+    This mirrors the DETR / ACT convention: when a pretrained ImageNet ResNet
+    is used as a visual backbone for a low-data downstream task (small batches,
+    high LR on the head), keeping BN frozen preserves the pretrained features
+    end-to-end. With a vanilla ``nn.BatchNorm2d`` instead, running stats drift
+    toward the small-batch statistics of the downstream data and the affine
+    params drift under gradient updates, which can rapidly destroy the
+    pretrained representations and effectively cut vision out of the loop.
+    """
+
+    def __init__(self, n):
+        super().__init__()
+        self.register_buffer("weight", torch.ones(n))
+        self.register_buffer("bias", torch.zeros(n))
+        self.register_buffer("running_mean", torch.zeros(n))
+        self.register_buffer("running_var", torch.ones(n))
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # torchvision BN ckpts also store ``num_batches_tracked``; drop it so
+        # it does not surface as an "unexpected key" when loading pretrained
+        # weights into FrozenBatchNorm2d.
+        num_batches_tracked_key = prefix + "num_batches_tracked"
+        if num_batches_tracked_key in state_dict:
+            del state_dict[num_batches_tracked_key]
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+    def forward(self, x):
+        # Reshape for broadcasting over (N, C, H, W).
+        w = self.weight.reshape(1, -1, 1, 1)
+        b = self.bias.reshape(1, -1, 1, 1)
+        rv = self.running_var.reshape(1, -1, 1, 1)
+        rm = self.running_mean.reshape(1, -1, 1, 1)
+        eps = 1e-5
+        scale = w * (rv + eps).rsqrt()
+        bias = b - rm * scale
+        return x * scale + bias
 
 
 def get_resnet_class(model_name):

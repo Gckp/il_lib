@@ -42,6 +42,11 @@ module:
     enable_random_crop: true
     random_crop_size: 224
     return_last_spatial_map: true
+    # DETR / original ACT convention: keep ImageNet BN stats frozen so the
+    # pretrained ResNet features survive training. Without this, vanilla BN's
+    # running stats and affine params drift under the head's high LR and the
+    # policy stops getting useful information from the cameras.
+    use_frozen_batch_norm: true
   pos_encoding:
     position_embedding: sine
     hidden_dim: ${module.hidden_dim}
