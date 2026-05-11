@@ -79,6 +79,10 @@ module:
   pre_norm: false
   kl_weight: 10
   temporal_ensemble: true
+  # Pretrained ImageNet ResNet runs at a much lower LR than the rest of
+  # the CVAE head; matches DETR / original ACT convention. Together with
+  # FrozenBatchNorm2d this keeps the pretrained visual features intact.
+  lr_backbone: 1.0e-5
 
 data:
   use_action_chunks: false

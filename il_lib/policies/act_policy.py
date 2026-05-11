@@ -50,6 +50,12 @@ class ACT(BasePolicy):
         use_proprio: bool = True,
         # ====== learning ======
         lr: float,
+        # Separate (typically lower) LR for the ImageNet-pretrained visual
+        # backbone. Mirrors the DETR / original-ACT convention of giving the
+        # pretrained ResNet a much smaller LR than the randomly-initialised
+        # CVAE head (e.g. backbone 1e-5 vs head 1e-4..1e-3). Leave as None
+        # to use the same ``lr`` everywhere.
+        lr_backbone: Optional[float] = None,
         use_cosine_lr: bool = False,
         lr_warmup_steps: Optional[int] = None,
         lr_cosine_steps: Optional[int] = None,
@@ -117,6 +123,7 @@ class ACT(BasePolicy):
         # ====== learning ======
         self.kl_weight = kl_weight
         self.lr = lr
+        self.lr_backbone = lr_backbone
         self.use_cosine_lr = use_cosine_lr
         self.lr_warmup_steps = lr_warmup_steps
         self.lr_cosine_steps = lr_cosine_steps
@@ -311,12 +318,49 @@ class ACT(BasePolicy):
         return data
     
     def _get_optimizer_groups(self, weight_decay, lr_layer_decay, lr_scale=1.0):
+        # Parameter names of the visual backbone are all prefixed by
+        # ``obs_backbone.`` (see ``self.obs_backbone = instantiate(...)``).
+        backbone_prefix = "obs_backbone."
+
+        if self.lr_backbone is None or self.lr_backbone == self.lr:
+            # Single LR for the whole model (original il_lib behaviour).
+            head_pg, _ = default_optimizer_groups(
+                self,
+                weight_decay=weight_decay,
+                lr_scale=lr_scale,
+            )
+            return head_pg
+
+        # Split into (backbone, head) groups so the optimizer can run the
+        # pretrained ResNet at a markedly lower LR than the randomly
+        # initialised CVAE head. This mirrors DETR / original ACT, where
+        # mixing a high head LR into a pretrained backbone quickly destroys
+        # the ImageNet features and effectively cuts vision out of the
+        # downstream task. Within each side we keep the standard
+        # decay / no-decay split from ``default_optimizer_groups``.
+        backbone_pg, _ = default_optimizer_groups(
+            self,
+            weight_decay=weight_decay,
+            lr_scale=lr_scale,
+            exclude_filter=lambda n, p: not n.startswith(backbone_prefix),
+        )
         head_pg, _ = default_optimizer_groups(
             self,
             weight_decay=weight_decay,
             lr_scale=lr_scale,
+            exclude_filter=lambda n, p: n.startswith(backbone_prefix),
         )
-        return head_pg
+        # Set per-group LR for the backbone groups; AdamW honours per-group
+        # ``lr`` and ``LambdaLR`` captures it as the group's ``base_lr`` so
+        # the same cosine multiplier applies proportionally to backbone and
+        # head (preserving the LR ratio across the schedule).
+        for group in backbone_pg:
+            group["lr"] = self.lr_backbone
+        # Drop empty groups (e.g. when the entire backbone is frozen) so we
+        # do not hand PyTorch an empty ``params`` list.
+        backbone_pg = [g for g in backbone_pg if len(g["params"]) > 0]
+        head_pg = [g for g in head_pg if len(g["params"]) > 0]
+        return backbone_pg + head_pg
 
     def _compute_loss(self, obs, actions, is_pad):
         """
