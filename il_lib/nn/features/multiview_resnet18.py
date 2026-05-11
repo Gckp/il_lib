@@ -87,6 +87,16 @@ class MultiviewResNet18(nn.Module):
         self._train_transforms = transforms.Compose(train_transforms)
         self._eval_transforms = transforms.Compose(eval_transforms)
 
+    @property
+    def views(self) -> List[str]:
+        """Configured camera/view names in the order they were registered.
+
+        Exposed so callers (e.g. ``ACT.process_data``) can deterministically
+        order their per-camera observation dicts instead of relying on the
+        data loader's incidental dict-iteration order.
+        """
+        return list(self._views)
+
     def forward(self, x):
         """
         x: a dict with keys in self._views and values of shape (B, L, C, H, W)

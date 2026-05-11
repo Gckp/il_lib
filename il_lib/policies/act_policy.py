@@ -316,12 +316,35 @@ class ACT(BasePolicy):
         data = {"qpos": data_batch["obs"]["qpos"], "eef": data_batch["obs"]["eef"]}
         if "odom" in data_batch["obs"]:
             data["odom"] = data_batch["obs"]["odom"]
+        # Explicitly pin camera/view order to ``obs_backbone.views`` rather
+        # than inheriting the data loader's incidental dict-iteration order.
+        # Order matters here: in the spatial-map path the per-camera feature
+        # maps are concatenated along the width axis, and the per-camera
+        # positional encodings are concatenated along the same axis -- so
+        # reordering cameras changes which (pos-encoded) tokens the
+        # transformer sees at which positions. A missing view raises
+        # ``KeyError`` loudly (rather than silently dropping a camera),
+        # which is the desired failure mode for config/data mismatches.
+        view_order = self.obs_backbone.views
         if "rgb" in self._features:
-            data["rgb"] = {k.rsplit("::", 1)[0]: data_batch["obs"][k].float() / 255.0 for k in data_batch["obs"] if "rgb" in k}
+            rgb_by_view = {
+                k.rsplit("::", 1)[0]: data_batch["obs"][k].float() / 255.0
+                for k in data_batch["obs"] if "rgb" in k
+            }
+            data["rgb"] = {v: rgb_by_view[v] for v in view_order}
         if "rgbd" in self._features:
-            rgb = {k.rsplit("::", 1)[0]: data_batch["obs"][k].float() / 255.0 for k in data_batch["obs"] if "rgb" in k}
-            depth = {k.rsplit("::", 1)[0]: (data_batch["obs"][k].float() - MIN_DEPTH) / (MAX_DEPTH - MIN_DEPTH) for k in data_batch["obs"] if "depth" in k}
-            data["rgbd"] = {k: torch.cat([rgb[k], depth[k].unsqueeze(-3)], dim=-3) for k in rgb}
+            rgb_by_view = {
+                k.rsplit("::", 1)[0]: data_batch["obs"][k].float() / 255.0
+                for k in data_batch["obs"] if "rgb" in k
+            }
+            depth_by_view = {
+                k.rsplit("::", 1)[0]: (data_batch["obs"][k].float() - MIN_DEPTH) / (MAX_DEPTH - MIN_DEPTH)
+                for k in data_batch["obs"] if "depth" in k
+            }
+            data["rgbd"] = {
+                v: torch.cat([rgb_by_view[v], depth_by_view[v].unsqueeze(-3)], dim=-3)
+                for v in view_order
+            }
         if "task" in self._features:
             data["task"] = data_batch["obs"]["task"]
         if extract_action:
