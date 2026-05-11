@@ -152,12 +152,22 @@ class ACT(BasePolicy):
         # flatten first two dims
         prop_obs = prop_obs.reshape(-1, prop_obs.shape[-1])  # (B * L, Prop_dim)
         if not self._use_proprio:
+            # Zero the raw proprio input as a first line of defence. Note this
+            # alone is NOT sufficient: ``encoder_prop_proj`` and
+            # ``input_proj_robot_state`` are frozen but their biases are
+            # non-zero from ``nn.Linear`` init, so ``Linear(zeros) == bias``
+            # would still inject a constant per-run proprio token. The
+            # post-Linear outputs are therefore re-zeroed below.
             prop_obs = torch.zeros_like(prop_obs)
 
         if is_training:
             # project action sequence to embedding dim, and concat with a CLS token
             action_embed = self.encoder_action_proj(actions)  # (B, seq, hidden_dim)
             prop_embed = self.encoder_prop_proj(prop_obs)  # (B, hidden_dim)
+            if not self._use_proprio:
+                # See note above: cut off the bias-leaking constant so the
+                # CVAE encoder genuinely sees no proprio information.
+                prop_embed = torch.zeros_like(prop_embed)
             prop_embed = torch.unsqueeze(prop_embed, dim=1)  # (B, 1, hidden_dim)
             cls_embed = self.cls_embed.weight  # (1, hidden_dim)
             cls_embed = torch.unsqueeze(cls_embed, dim=0).repeat(
@@ -199,6 +209,11 @@ class ACT(BasePolicy):
             all_cam_pos.append(pos)
         # proprioception features
         proprio_input = self.input_proj_robot_state(prop_obs)
+        if not self._use_proprio:
+            # See note in the CVAE encoder branch: zero out the post-Linear
+            # bias leak so the CVAE decoder cross-attends to a true-zero
+            # proprio token in vision-only mode.
+            proprio_input = torch.zeros_like(proprio_input)
         # fold camera dimension into width dimension
         src = torch.cat(all_cam_features, axis=3)
         pos = torch.cat(all_cam_pos, axis=3)
