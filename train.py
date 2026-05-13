@@ -25,14 +25,21 @@ if sys.version_info >= (3, 14):
     argparse.ArgumentParser._check_help = _check_help_py314  # type: ignore[method-assign]
 
 import hydra
+from omegaconf import OmegaConf
 
-from il_lib.utils.training_utils import seed_everywhere
+from il_lib.utils.training_utils import (
+    accelerator_requests_cuda,
+    seed_everywhere,
+    wait_for_cuda_devices_ready,
+)
 from il_lib.utils.config_utils import omegaconf_to_dict
 from il_lib.training import Trainer
 
 
 @hydra.main(config_name="base_config", config_path="il_lib/configs", version_base="1.1")
 def main(cfg):
+    accelerator = OmegaConf.select(cfg, "trainer.accelerator", default="gpu")
+    wait_for_cuda_devices_ready(enabled=accelerator_requests_cuda(accelerator))
     cfg.seed = seed_everywhere(cfg.seed)
     trainer_ = Trainer(cfg)
     trainer_.trainer.loggers[-1].log_hyperparams(omegaconf_to_dict(cfg))

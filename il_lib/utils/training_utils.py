@@ -1,5 +1,6 @@
 import os
 import random
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -8,6 +9,97 @@ from il_lib.utils.functional_utils import implements_method
 from il_lib.utils.tree_utils import tree_value_at_path
 from il_lib.utils.file_utils import f_join
 from typing import Union, List, Tuple
+
+
+def accelerator_requests_cuda(accelerator: str) -> bool:
+    """True if the Lightning accelerator setting may use CUDA."""
+    a = str(accelerator).lower()
+    if a in ("gpu", "cuda"):
+        return True
+    if a == "auto":
+        return torch.cuda.is_available()
+    return False
+
+
+def wait_for_cuda_devices_ready(enabled: bool = True) -> None:
+    """Block until the local process can run real work on its CUDA device.
+
+    On shared clusters, SLURM may start the job before the GPU is fully released
+    from a prior tenant; NCCL then fails during ``init_process_group`` with
+    "CUDA-capable device(s) is/are busy or unavailable". This loop polls until
+    a small allocation and kernel succeed or the timeout is reached.
+
+    Environment (optional):
+
+    - ``IL_LIB_CUDA_WAIT``: set to ``0`` / ``false`` / ``no`` to disable.
+    - ``IL_LIB_CUDA_WAIT_TIMEOUT_SEC``: max seconds to wait (default ``14400``).
+    - ``IL_LIB_CUDA_WAIT_POLL_SEC``: sleep between attempts (default ``15``).
+    """
+    if not enabled:
+        return
+    flag = os.environ.get("IL_LIB_CUDA_WAIT", "1").lower()
+    if flag in ("0", "false", "no", "off"):
+        return
+    if not torch.cuda.is_available():
+        return
+
+    timeout_sec = float(os.environ.get("IL_LIB_CUDA_WAIT_TIMEOUT_SEC", "14400"))
+    poll_sec = float(os.environ.get("IL_LIB_CUDA_WAIT_POLL_SEC", "15"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    wait_started = time.monotonic()
+    deadline = wait_started + timeout_sec
+    attempt = 0
+
+    def _probe() -> None:
+        torch.cuda.set_device(local_rank)
+        torch.cuda.init()
+        # Allocation + GEMM exercises the driver similarly to NCCL setup.
+        t = torch.empty((256, 256), device=f"cuda:{local_rank}", dtype=torch.float32)
+        torch.mm(t, t)
+        torch.cuda.synchronize()
+        del t
+
+    while True:
+        try:
+            _probe()
+            if attempt > 0:
+                print(
+                    f"[il_lib] CUDA local_rank={local_rank} ready after "
+                    f"{time.monotonic() - wait_started:.0f}s.",
+                    flush=True,
+                )
+            return
+        except RuntimeError as e:
+            err = str(e).lower()
+            if "out of memory" in err:
+                raise
+            retryable = any(
+                s in err
+                for s in (
+                    "busy",
+                    "unavailable",
+                    "not ready",
+                    "device not initialized",
+                    "unknown cuda error",
+                )
+            )
+            if not retryable:
+                raise
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"CUDA device local_rank={local_rank} still busy or unusable after "
+                f"{timeout_sec:.0f}s (set IL_LIB_CUDA_WAIT_TIMEOUT_SEC to wait longer, "
+                "or IL_LIB_CUDA_WAIT=0 to skip this wait)."
+            ) from None
+        attempt += 1
+        if attempt == 1 or attempt % max(1, int(60 / max(poll_sec, 1))) == 0:
+            print(
+                f"[il_lib] Waiting for CUDA local_rank={local_rank} to become usable "
+                f"(attempt {attempt}, {max(0.0, deadline - time.monotonic()):.0f}s left); "
+                f"sleeping {poll_sec:.1f}s.",
+                flush=True,
+            )
+        time.sleep(poll_sec)
 
 
 def seed_everywhere(seed, torch_deterministic=False, rank=0):
