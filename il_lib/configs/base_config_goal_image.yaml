@@ -147,12 +147,22 @@ trainer:
   gradient_clip_val: 1.0
   fast_dev_run: false
   checkpoint:
-  - filename: "step{step}-train_loss{train/loss:.5f}"
+  # The first stream used to monitor ``train/loss``. With step-based validation
+  # (``val_check_interval: 2000``) and ``training_step`` logging
+  # ``on_step=False, on_epoch=True`` (see ``policy_base.py``), the epoch-aggregated
+  # ``train/loss`` key only appears once an epoch finishes. For small batch sizes
+  # (e.g. ``bs=8`` in ``act_goal_og``) an epoch is many thousands of steps -- much
+  # longer than the 2000-step validation interval -- so when the ckpt callback
+  # fires at val-end, ``train/loss`` is not yet in the metrics dict and Lightning
+  # raises ``MisconfigurationException``. Monitoring ``val/loss`` instead is both
+  # safe (always populated at val-end) and a better selection criterion (catches
+  # overfitting).
+  - filename: "step{step}-val_loss{val/loss:.5f}"
     every_n_train_steps: 2000
     save_on_train_epoch_end: false
     save_top_k: 10
     save_last: true
-    monitor: "train/loss"
+    monitor: "val/loss"
     mode: min
     auto_insert_metric_name: false
   - filename: "step{step}-val_l1_{val/l1:.5f}"
