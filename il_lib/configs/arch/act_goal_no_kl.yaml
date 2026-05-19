@@ -1,0 +1,88 @@
+# @package _global_
+#
+# ACT baseline with goal-image conditioning, KL term disabled.
+#
+# Hypothesis tested:
+#   The CVAE is the source of whole-obs conditioning collapse. ``kl_weight=10``
+#   pressures the encoder posterior toward the standard-normal prior; if the
+#   prior wins, the latent carries no input information and the decoder learns
+#   to predict the marginal mean trajectory unconditionally. Setting
+#   ``kl_weight=0`` removes that pressure entirely.
+#
+# Differences vs. ``arch/act_goal.yaml``:
+#   * ``module.kl_weight`` : 10 -> 0
+#
+# Note: ``kl_weight=0`` does NOT also zero the latent during training. The
+# encoder still consumes obs+actions+proprio and produces a sampled latent that
+# the decoder can use. This isolates the effect of the KL penalty itself; if
+# we want to additionally starve the latent-path of input, ``use_proprio=false``
+# closes the proprio input to the encoder (see ``act_goal_vision_only.yaml``).
+#
+# Expected read on the sensitivity probe:
+#   * If action-distance under goal_swap / head_swap becomes non-zero -> the
+#     KL pressure was driving collapse; lowering it (or scheduling it) is the
+#     fix and we can sweep ``kl_weight in {0.1, 1.0, 10}`` to find the knee.
+#   * If still bit-zero -> either the encoder is leaking everything through the
+#     latent anyway, or the issue is downstream of the CVAE entirely.
+
+arch_name: act_goal_no_kl
+
+# ====== Policy specific ======
+num_latest_obs: 1
+horizon: 20
+deployed_action_steps: 1  # change to ${horizon} if temporal ensemble is off
+wd: 0.1
+bs: 128
+
+# ------ module ------
+module:
+  _target_: il_lib.policies.ACT
+  prop_dim: 37
+  prop_keys:
+    - odom/base_velocity
+    - qpos/torso
+    - qpos/left_arm
+    - qpos/left_gripper
+    - qpos/right_arm
+    - qpos/right_gripper
+    - eef/left_pos
+    - eef/left_quat
+    - eef/right_pos
+    - eef/right_quat
+  action_dim: 23
+  action_keys: ${robot.action_keys}
+  use_proprio: true
+  features: [proprioception, rgb]
+  obs_backbone:
+    _target_: il_lib.nn.features.MultiviewResNet18
+    backbone: resnet18
+    views:
+      - robot_r1::robot_r1:zed_link:Camera:0
+      - robot_r1::goal::Camera:0
+    resnet_output_dim: 512
+    use_shared_backbone: true
+    load_pretrained: true
+    include_depth: false
+    enable_random_crop: false
+    random_crop_size: 224
+    return_last_spatial_map: true
+    use_frozen_batch_norm: true
+  pos_encoding:
+    position_embedding: sine
+    hidden_dim: ${module.hidden_dim}
+  num_queries: ${horizon}
+  hidden_dim: 512
+  dropout: 0.1
+  n_heads: 8
+  dim_feedforward: 3200
+  num_encoder_layers: 4
+  num_decoder_layers: 7
+  pre_norm: false
+  kl_weight: 0
+  temporal_ensemble: true
+  lr_backbone: 1.0e-5
+
+data:
+  use_action_chunks: false
+  visual_obs_types: [rgb]
+  use_task_info: false

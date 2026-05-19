@@ -1,0 +1,102 @@
+# @package _global_
+#
+# ACT baseline with goal-image conditioning, maximally aligned to the
+# canonical ACT recipe: optimizer + chunk time-horizon.
+#
+# Hypothesis tested:
+#   Compounded effect of (lr, wd, bs, horizon) divergence. If our data is
+#   trainable at all with the canonical ACT recipe, this configuration should
+#   produce a non-collapsed model. If it still collapses, the issue is in our
+#   data distribution / model assumptions, not in il_lib's hyperparameter
+#   choices, and a from-scratch ACT migration is unlikely to help either.
+#
+# This is a "kitchen-sink alignment" run, not an isolating ablation. It is
+# only meaningful when read alongside the single-variable configs:
+#
+#   baseline      = act_goal.yaml
+#   H1            = act_goal_og.yaml          (lr, wd, bs only)
+#   H2            = act_goal_no_kl.yaml       (kl_weight=0 only)
+#   H3            = act_goal_vision_only.yaml (use_proprio=false + kl=0)
+#   H4            = act_goal_horizon60.yaml   (horizon=60 only)
+#   H1+H4         = act_goal_full_og.yaml     (this file)
+#
+# Differences vs. ``arch/act_goal.yaml``:
+#   * ``lr``       : 7e-4  -> 1e-5     (ACT ``--lr``)
+#   * ``wd``       : 0.1   -> 1e-4     (ACT default ``--weight_decay``)
+#   * ``bs``       : 128   -> 8        (ACT ``--batch_size``)
+#   * ``horizon``  : 20    -> 60       (ACT chunk=100 @ 50 Hz -> 60 @ 30 Hz)
+#
+# ``kl_weight=10`` is kept as in canonical ACT. ``lr_backbone=1.0e-5`` already
+# matches ACT in both configs.
+#
+# Caveat (same as ``act_goal_og.yaml``):
+#   Canonical ACT runs a fixed LR for the full training duration. il_lib
+#   inherits a cosine schedule (``lr_warmup_steps``, ``lr_cosine_steps``,
+#   ``lr_cosine_min``) from ``base_config_goal_image.yaml`` which is not
+#   adjusted here. With bs=8 the steps-per-epoch ratio is 16x the bs=128
+#   baseline, so the cosine schedule will bottom out much earlier in real
+#   epochs than the canonical ACT regime intended. If results suggest
+#   under-training, override ``lr_cosine_steps`` upward on the CLI.
+
+arch_name: act_goal_full_og
+
+# ====== Policy specific ======
+num_latest_obs: 1
+horizon: 60
+deployed_action_steps: 1  # change to ${horizon} if temporal ensemble is off
+lr: 1.0e-5
+wd: 1.0e-4
+bs: 8
+
+# ------ module ------
+module:
+  _target_: il_lib.policies.ACT
+  prop_dim: 37
+  prop_keys:
+    - odom/base_velocity
+    - qpos/torso
+    - qpos/left_arm
+    - qpos/left_gripper
+    - qpos/right_arm
+    - qpos/right_gripper
+    - eef/left_pos
+    - eef/left_quat
+    - eef/right_pos
+    - eef/right_quat
+  action_dim: 23
+  action_keys: ${robot.action_keys}
+  use_proprio: true
+  features: [proprioception, rgb]
+  obs_backbone:
+    _target_: il_lib.nn.features.MultiviewResNet18
+    backbone: resnet18
+    views:
+      - robot_r1::robot_r1:zed_link:Camera:0
+      - robot_r1::goal::Camera:0
+    resnet_output_dim: 512
+    use_shared_backbone: true
+    load_pretrained: true
+    include_depth: false
+    enable_random_crop: false
+    random_crop_size: 224
+    return_last_spatial_map: true
+    use_frozen_batch_norm: true
+  pos_encoding:
+    position_embedding: sine
+    hidden_dim: ${module.hidden_dim}
+  num_queries: ${horizon}
+  hidden_dim: 512
+  dropout: 0.1
+  n_heads: 8
+  dim_feedforward: 3200
+  num_encoder_layers: 4
+  num_decoder_layers: 7
+  pre_norm: false
+  kl_weight: 10
+  temporal_ensemble: true
+  lr_backbone: 1.0e-5
+
+data:
+  use_action_chunks: false
+  visual_obs_types: [rgb]
+  use_task_info: false

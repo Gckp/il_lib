@@ -1,0 +1,95 @@
+# @package _global_
+#
+# ACT baseline with goal-image conditioning, vision-only and KL disabled.
+#
+# Hypothesis tested:
+#   The decoder is structurally able to use visual cross-attention -- it just
+#   never had to during training, because (a) the CVAE latent and (b) the
+#   proprio token together explained enough of the action variance. Removing
+#   both forces the model to use visual tokens or fail entirely. If visual
+#   conditioning is wired up correctly end-to-end, this configuration should
+#   yield non-zero action sensitivity under goal_swap / head_swap.
+#
+# Differences vs. ``arch/act_goal.yaml``:
+#   * ``module.use_proprio``  : true -> false   (proprio zeroed at runtime,
+#                                                proprio MLPs frozen by the
+#                                                policy code -- see
+#                                                ``act_policy.py``)
+#   * ``module.kl_weight``    : 10   -> 0       (no KL pressure on the latent)
+#
+# Interpretation table (paired with ``act_goal_no_kl.yaml``):
+#   * vision_only responds, no_kl does NOT -> proprio token was drowning out
+#     vision; the encoder/decoder do use vision when forced.
+#   * Both respond -> the CVAE was eating the conditioning signal; lower KL.
+#   * Neither responds -> there is a real architectural problem in how visual
+#     tokens flow to the decoder, independent of the CVAE / proprio path.
+#   * Only no_kl responds -> proprio + KL combine in some non-additive way
+#     (less likely, but worth knowing).
+#
+# Note: il_lib's vision-only branch zeros ``prop_embed`` and ``proprio_input``
+# after the linear projections (see the fix we landed earlier for the bias-leak
+# when ``use_proprio=false``), so the proprio token is structurally inert in
+# this config and the only obs information available to the decoder is the
+# multi-view ResNet features (head + goal cameras).
+
+arch_name: act_goal_vision_only
+
+# ====== Policy specific ======
+num_latest_obs: 1
+horizon: 20
+deployed_action_steps: 1  # change to ${horizon} if temporal ensemble is off
+wd: 0.1
+bs: 128
+
+# ------ module ------
+module:
+  _target_: il_lib.policies.ACT
+  prop_dim: 37
+  prop_keys:
+    - odom/base_velocity
+    - qpos/torso
+    - qpos/left_arm
+    - qpos/left_gripper
+    - qpos/right_arm
+    - qpos/right_gripper
+    - eef/left_pos
+    - eef/left_quat
+    - eef/right_pos
+    - eef/right_quat
+  action_dim: 23
+  action_keys: ${robot.action_keys}
+  use_proprio: false
+  features: [proprioception, rgb]
+  obs_backbone:
+    _target_: il_lib.nn.features.MultiviewResNet18
+    backbone: resnet18
+    views:
+      - robot_r1::robot_r1:zed_link:Camera:0
+      - robot_r1::goal::Camera:0
+    resnet_output_dim: 512
+    use_shared_backbone: true
+    load_pretrained: true
+    include_depth: false
+    enable_random_crop: false
+    random_crop_size: 224
+    return_last_spatial_map: true
+    use_frozen_batch_norm: true
+  pos_encoding:
+    position_embedding: sine
+    hidden_dim: ${module.hidden_dim}
+  num_queries: ${horizon}
+  hidden_dim: 512
+  dropout: 0.1
+  n_heads: 8
+  dim_feedforward: 3200
+  num_encoder_layers: 4
+  num_decoder_layers: 7
+  pre_norm: false
+  kl_weight: 0
+  temporal_ensemble: true
+  lr_backbone: 1.0e-5
+
+data:
+  use_action_chunks: false
+  visual_obs_types: [rgb]
+  use_task_info: false

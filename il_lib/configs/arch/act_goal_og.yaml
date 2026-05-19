@@ -1,0 +1,102 @@
+# @package _global_
+#
+# ACT baseline with goal-image conditioning, aligned to the canonical ACT
+# recipe on (lr, weight decay, batch size).
+#
+# Differences vs. ``arch/act_goal.yaml``:
+#   * ``lr``  : 7e-4  -> 1e-5   (ACT README example for ALOHA)
+#   * ``wd``  : 0.1   -> 1e-4   (ACT default in ``act/detr/main.py:17``)
+#   * ``bs``  : 128   -> 8      (ACT README example for ALOHA)
+#
+# Everything else (architecture, kl_weight=10, horizon=20, FrozenBatchNorm,
+# lr_backbone=1e-5, temporal ensembling, RGB-only views, goal-image view) is
+# kept identical to ``act_goal.yaml`` so this is a clean ablation on the three
+# divergences that most plausibly drive the "decoder ignores its inputs"
+# pattern observed in the goal-sensitivity probe.
+#
+# Caveat (not changed here, flag for later):
+#   * ACT uses a fixed LR with no warmup / cosine schedule. il_lib inherits a
+#     cosine schedule (``lr_warmup_steps``, ``lr_cosine_steps``, ``lr_cosine_min``)
+#     from ``base_config_goal_image.yaml``. With bs=8 the effective epoch count
+#     per ``lr_cosine_steps`` is 16x smaller than the bs=128 baseline -- worth
+#     re-checking ``lr_cosine_steps`` if training looks under- or over-cooked.
+
+arch_name: act_goal_og
+
+# ====== Policy specific ======
+num_latest_obs: 1
+horizon: 20
+deployed_action_steps: 1  # change to ${horizon} if temporal ensemble is off
+lr: 1.0e-5
+wd: 1.0e-4
+bs: 8
+
+# ------ module ------
+module:
+  _target_: il_lib.policies.ACT
+  prop_dim: 37
+  prop_keys:
+    - odom/base_velocity
+    - qpos/torso
+    - qpos/left_arm
+    - qpos/left_gripper
+    - qpos/right_arm
+    - qpos/right_gripper
+    - eef/left_pos
+    - eef/left_quat
+    - eef/right_pos
+    - eef/right_quat
+  action_dim: 23
+  action_keys: ${robot.action_keys}
+  # Set false for vision-only (ResNet views + latent; proprio replaced with
+  # zeros and proprio MLPs frozen). Override: ``module.use_proprio=false``.
+  use_proprio: true
+  # RGB-only: goal image is a single PNG per demo with no depth channel,
+  # so we run every view through a 3-channel ResNet18. ACT.process_data
+  # routes every ``obs`` key containing "rgb" into the multi-view backbone.
+  features: [proprioception, rgb]
+  obs_backbone:
+    _target_: il_lib.nn.features.MultiviewResNet18
+    backbone: resnet18
+    # Two views total, matching the GCBC goal-image pipeline:
+    #   - head camera RGB (current observation)
+    #   - goal image RGB (per-episode reference)
+    # The wrist cameras from ``robot/r1pro.yaml`` are intentionally dropped.
+    views:
+      - robot_r1::robot_r1:zed_link:Camera:0
+      - robot_r1::goal::Camera:0
+    resnet_output_dim: 512
+    use_shared_backbone: true
+    load_pretrained: true
+    include_depth: false
+    enable_random_crop: false # match gcbc --no-augment
+    random_crop_size: 224
+    return_last_spatial_map: true
+    # DETR / original ACT convention: keep ImageNet BN stats frozen so the
+    # pretrained ResNet features survive training. Without this, vanilla BN's
+    # running stats and affine params drift under the head's high LR and the
+    # policy stops getting useful information from the cameras.
+    use_frozen_batch_norm: true
+  pos_encoding:
+    position_embedding: sine
+    hidden_dim: ${module.hidden_dim}
+  num_queries: ${horizon}
+  hidden_dim: 512
+  dropout: 0.1
+  n_heads: 8
+  dim_feedforward: 3200
+  num_encoder_layers: 4
+  num_decoder_layers: 7
+  pre_norm: false
+  kl_weight: 10
+  temporal_ensemble: true
+  # Pretrained ImageNet ResNet runs at a much lower LR than the rest of
+  # the CVAE head; matches DETR / original ACT convention. Together with
+  # FrozenBatchNorm2d this keeps the pretrained visual features intact.
+  lr_backbone: 1.0e-5
+
+data:
+  use_action_chunks: false
+  # RGB-only to match the goal-image pipeline.
+  visual_obs_types: [rgb]
+  use_task_info: false
