@@ -15,10 +15,11 @@ arch_name: act_goal
 
 # ====== Policy specific ======
 num_latest_obs: 1
-horizon: 20
+horizon: 60
 deployed_action_steps: 1  # change to ${horizon} if temporal ensemble is off
-wd: 0.1
-bs: 128
+lr: 1.0e-5
+wd: 1.0e-4
+bs: 8
 
 # ------ module ------
 module:
