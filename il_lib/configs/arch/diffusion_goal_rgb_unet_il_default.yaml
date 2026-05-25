@@ -106,6 +106,17 @@ module:
   horizon: ${horizon}
   deployed_action_steps: ${deployed_action_steps}
   optimizer: adam
+  # EMA stays ON even in this il_lib-defaults control. We accepted EMA as a
+  # non-ablated baseline change (canonical DP requires it). The control here
+  # tests only the lr / wd / bs / UNet-capacity divergences from canonical DP,
+  # not EMA. See ``diffusion_goal_rgb_unet.yaml`` for the full DP-aligned
+  # config and EMA documentation.
+  use_ema: true
+  ema_power: 0.75
+  ema_update_after_step: 0
+  ema_inv_gamma: 1.0
+  ema_min_value: 0.0
+  ema_max_value: 0.9999
 
 data:
   use_action_chunks: false

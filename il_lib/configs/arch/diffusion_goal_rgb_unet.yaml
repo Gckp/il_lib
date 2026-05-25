@@ -163,6 +163,18 @@ module:
   # ``DiffusionPolicy`` supports ``adam`` and ``adamw``; pick ``adamw`` to
   # match DP. Betas are not exposed as a config kwarg.
   optimizer: adamw
+  # ====== EMA ======
+  # Canonical DP averages the policy weights via EMA and uses the averaged
+  # copy for all inference. Without this, validation loss is much noisier
+  # and final deployment performance is worse. Defaults below match the
+  # DP UNet image workspace recipe
+  # (``diffusion_policy-main/.../train_diffusion_unet_image_workspace.yaml``).
+  use_ema: true
+  ema_power: 0.75
+  ema_update_after_step: 0
+  ema_inv_gamma: 1.0
+  ema_min_value: 0.0
+  ema_max_value: 0.9999
 
 data:
   use_action_chunks: false

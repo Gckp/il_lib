@@ -107,6 +107,13 @@ module:
   horizon: ${horizon}
   deployed_action_steps: ${deployed_action_steps}
   optimizer: adamw
+  # Canonical DP EMA. See ``diffusion_goal_rgb_unet.yaml`` for rationale.
+  use_ema: true
+  ema_power: 0.75
+  ema_update_after_step: 0
+  ema_inv_gamma: 1.0
+  ema_min_value: 0.0
+  ema_max_value: 0.9999
 
 data:
   use_action_chunks: false

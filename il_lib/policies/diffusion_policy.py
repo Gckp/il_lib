@@ -1,6 +1,10 @@
+import contextlib
+import copy
+
 import torch
 import torch.nn.functional as F
 from hydra.utils import instantiate
+from il_lib.nn.diffusion import EMAModel
 from il_lib.nn.features import SimpleFeatureFusion
 from il_lib.optim import CosineScheduleFunction
 from il_lib.policies.policy_base import BasePolicy
@@ -53,6 +57,21 @@ class DiffusionPolicy(BasePolicy):
         lr_layer_decay: float = 1.0,
         optimizer: str = "adam",
         weight_decay: float = 0.0,
+        # ====== EMA ======
+        # Exponential Moving Average over policy weights. Canonical Diffusion
+        # Policy (Chi et al. 2023) maintains a slow-moving shadow copy of the
+        # trainable parameters and uses it for all inference; this absorbs
+        # the high-variance per-step gradients that come from sampling random
+        # diffusion timesteps. Without EMA, val loss is much noisier and final
+        # rollout performance is meaningfully worse. Off by default to avoid
+        # silently changing behaviour for the existing ``diffusion_*`` configs;
+        # enabled in the ``diffusion_goal_*`` configs that target this work.
+        use_ema: bool = False,
+        ema_power: float = 0.75,
+        ema_update_after_step: int = 0,
+        ema_inv_gamma: float = 1.0,
+        ema_min_value: float = 0.0,
+        ema_max_value: float = 0.9999,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -94,8 +113,93 @@ class DiffusionPolicy(BasePolicy):
         self.lr_layer_decay = lr_layer_decay
         self.optimizer = optimizer
         self.weight_decay = weight_decay
+        # ====== EMA ======
+        # The EMA copies live as ``nn.Module`` submodule attributes
+        # (``ema_feature_extractor`` / ``ema_backbone``) and the step counter
+        # is a registered buffer, so all three flow through Lightning's
+        # ``state_dict`` -- no custom ``on_save_checkpoint`` hook required.
+        # The ``EMAModel`` helper holds only the decay schedule (no state),
+        # so it does not need to be persisted.
+        self.use_ema = use_ema
+        if use_ema:
+            self.ema_feature_extractor = copy.deepcopy(self.feature_extractor)
+            self.ema_backbone = copy.deepcopy(self.backbone)
+            for m in (self.ema_feature_extractor, self.ema_backbone):
+                m.eval()
+                m.requires_grad_(False)
+            self._ema_helper = EMAModel(
+                update_after_step=ema_update_after_step,
+                inv_gamma=ema_inv_gamma,
+                power=ema_power,
+                min_value=ema_min_value,
+                max_value=ema_max_value,
+            )
+            self.register_buffer(
+                "ema_step", torch.tensor(0, dtype=torch.long), persistent=True
+            )
+        else:
+            self._ema_helper = None
         # Save hyperparameters
         self.save_hyperparameters()
+
+    @contextlib.contextmanager
+    def _ema_inference(self):
+        """Run a block with ``self.feature_extractor`` / ``self.backbone``
+        temporarily pointing at their EMA copies. No-op when ``use_ema`` is
+        false. Used by ``act()`` and ``policy_evaluation_step()`` so all
+        inference paths see the averaged weights, matching canonical DP.
+
+        Restores the live references in a ``finally`` so an exception inside
+        the block can never leave the live submodules swapped out (which
+        would silently corrupt subsequent training -- the optimizer would
+        keep updating the live params it cached at ``configure_optimizers``
+        time, but inference logic on ``self.feature_extractor`` would point
+        at EMA weights).
+        """
+        if not self.use_ema:
+            yield
+            return
+        live_fe = self.feature_extractor
+        live_bb = self.backbone
+        # NOTE: bypass ``nn.Module.__setattr__`` to swap submodules without
+        # tripping the registration logic (which would remove ``live_fe`` /
+        # ``live_bb`` from ``_modules`` and replace them, leaving the
+        # optimizer's cached param references stale-but-valid; the restore
+        # path would still work, but the intermediate state is awkward and
+        # subtle bugs could appear if anyone introspects ``self.parameters()``
+        # mid-block). Direct ``_modules`` assignment swaps just the lookup.
+        self._modules["feature_extractor"] = self.ema_feature_extractor
+        self._modules["backbone"] = self.ema_backbone
+        try:
+            yield
+        finally:
+            self._modules["feature_extractor"] = live_fe
+            self._modules["backbone"] = live_bb
+
+    def optimizer_step(self, *args, **kwargs):
+        """After each optimizer step, update the EMA copies in lockstep with
+        the live weights. ``optimizer_step`` (as opposed to
+        ``on_train_batch_end``) is the right hook because it fires once per
+        actual optimization step -- gradient accumulation will still trigger
+        a single EMA update per fused step instead of one per micro-batch.
+        """
+        super().optimizer_step(*args, **kwargs)
+        if not self.use_ema:
+            return
+        self._ema_helper.step(
+            live_modules=[self.feature_extractor, self.backbone],
+            ema_modules=[self.ema_feature_extractor, self.ema_backbone],
+            optimization_step=int(self.ema_step.item()),
+        )
+        self.ema_step += 1
+        # Log so we can confirm decay is ramping correctly without scanning
+        # checkpoints. ``log`` is safe inside ``optimizer_step``.
+        self.log(
+            "train/ema_decay",
+            float(self._ema_helper.last_decay),
+            on_step=True,
+            on_epoch=False,
+        )
 
     def forward(self, obs, noisy_traj, diffusion_timesteps):
         """
@@ -127,23 +231,27 @@ class DiffusionPolicy(BasePolicy):
 
     @torch.no_grad()
     def act(self, obs: dict) -> torch.Tensor:
-        obs = self.process_data(obs, extract_action=False)
-        B = get_batch_size(obs, strict=True)
-        noisy_traj = torch.randn(
-            size=(B, self.horizon, self.action_dim),
-            device=self.device,
-            dtype=self.dtype,
-        )
-        scheduler = self.noise_scheduler
-        scheduler.set_timesteps(self.num_denoise_steps_per_inference)
+        # Inference runs through the EMA-averaged copies (no-op when
+        # ``use_ema`` is False); this matches canonical DP's rollout path
+        # where the live training weights are never used at deployment time.
+        with self._ema_inference():
+            obs = self.process_data(obs, extract_action=False)
+            B = get_batch_size(obs, strict=True)
+            noisy_traj = torch.randn(
+                size=(B, self.horizon, self.action_dim),
+                device=self.device,
+                dtype=self.dtype,
+            )
+            scheduler = self.noise_scheduler
+            scheduler.set_timesteps(self.num_denoise_steps_per_inference)
 
-        for t in scheduler.timesteps:
-            pred = self.forward(obs, noisy_traj, t)
-            # denosing
-            noisy_traj = scheduler.step(
-                pred, t, noisy_traj, **self.noise_scheduler_step_kwargs
-            ).prev_sample  # (B, L, action_dim)
-        action = noisy_traj[:, self.num_latest_obs - 1:].clone().cpu()  # (B, L, action_dim)
+            for t in scheduler.timesteps:
+                pred = self.forward(obs, noisy_traj, t)
+                # denosing
+                noisy_traj = scheduler.step(
+                    pred, t, noisy_traj, **self.noise_scheduler_step_kwargs
+                ).prev_sample  # (B, L, action_dim)
+            action = noisy_traj[:, self.num_latest_obs - 1:].clone().cpu()  # (B, L, action_dim)
         # denormalize action
         return self._denormalize_action(action)
 
@@ -207,8 +315,18 @@ class DiffusionPolicy(BasePolicy):
     def policy_evaluation_step(self, batch, batch_idx):
         """
         Will denoise as if it is in rollout
-        but no env interaction
+        but no env interaction.
+
+        Wrapped in ``_ema_inference`` so the reported ``val/loss`` / ``val/l1``
+        / ``val/l1_deployed_steps_only`` reflect the EMA-averaged policy (the
+        thing we actually deploy), not the noisier live training weights.
+        Lightning has already entered eval mode + ``torch.no_grad`` by the
+        time we get here, so the swap is safe.
         """
+        with self._ema_inference():
+            return self._policy_evaluation_step_impl(batch, batch_idx)
+
+    def _policy_evaluation_step_impl(self, batch, batch_idx):
         batch["actions"] = any_concat(
             [batch["actions"][k] for k in self._action_keys], dim=-1
         )  # (B, ctx_len, A)
@@ -269,15 +387,22 @@ class DiffusionPolicy(BasePolicy):
         )
 
     def configure_optimizers(self):
+        # Filter to trainable params only. With ``use_ema=True`` the EMA
+        # submodules are registered children of ``self`` and would otherwise
+        # appear in ``self.parameters()`` -- they have ``requires_grad=False``
+        # so the optimizer would skip their updates, but AdamW still
+        # allocates optimizer state (m / v moments) for every param it sees,
+        # which is pure overhead. Filtering avoids that.
+        trainable_params = [p for p in self.parameters() if p.requires_grad]
         if self.optimizer == "adamw":
             optimizer = torch.optim.AdamW(
-                self.parameters(),
+                trainable_params,
                 lr=self.lr,
                 weight_decay=self.weight_decay,
             )
         elif self.optimizer == "adam":
             optimizer = torch.optim.Adam(
-                self.parameters(),
+                trainable_params,
                 lr=self.lr,
                 weight_decay=self.weight_decay,
             )
