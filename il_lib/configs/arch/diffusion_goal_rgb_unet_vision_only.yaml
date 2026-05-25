@@ -1,0 +1,111 @@
+# @package _global_
+#
+# Diffusion Policy (UNet backbone) with goal-image conditioning, vision-only.
+#
+# Hypothesis tested:
+#   For ACT on mental rotation, removing proprio was the single biggest win
+#   (0.97 success vs 0.80 for the full canonical-ACT recipe). The reasoning
+#   was that proprio is a high-SNR signal that correlates with the action
+#   trajectory but carries no orientation information, so the model latches
+#   onto it and ignores the goal image. Test whether the same dynamic applies
+#   to diffusion.
+#
+# Differences vs. ``diffusion_goal_rgb_unet.yaml``:
+#   * The ``proprioception`` feature extractor is removed.
+#   * ``prop_keys`` are retained (the policy's forward still constructs
+#     ``prop_obs`` from them, but with proprioception not in
+#     ``feature_extractors`` the resulting tensor is filtered out of
+#     ``obs`` before reaching ``feature_extractor`` -- see
+#     ``DiffusionPolicy.forward``). Net effect: visual features
+#     (head camera + goal image) are the only conditioning the UNet sees.
+#
+# Caveat: ``DiffusionPolicy.forward`` still computes ``prop_obs`` via
+# ``torch.cat`` over ``prop_keys`` and assigns it to ``obs["proprioception"]``
+# before filtering. This means we cannot also empty ``prop_keys`` here
+# (torch.cat on an empty list would crash). The wasted compute is negligible
+# -- a few cat operations per forward pass -- and worth not touching the
+# policy code for.
+
+arch_name: diffusion_goal_rgb_unet_vision_only
+
+# ====== Policy specific ======
+horizon: 16
+num_latest_obs: 2
+deployed_action_steps: 8
+lr: 1.0e-4
+wd: 1.0e-6
+bs: 64
+
+# ====== Policy Module ======
+module:
+  _target_: il_lib.policies.DiffusionPolicy
+  prop_dim: 37
+  prop_keys:
+    - odom/base_velocity
+    - qpos/torso
+    - qpos/left_arm
+    - qpos/left_gripper
+    - qpos/right_arm
+    - qpos/right_gripper
+    - eef/left_pos
+    - eef/left_quat
+    - eef/right_pos
+    - eef/right_quat
+  # Vision-only: no ``proprioception`` extractor. Only ``rgb`` is in
+  # ``self._features``, so ``obs`` is filtered to ``{"rgb": ...}`` before
+  # reaching the feature_extractor.
+  feature_extractors:
+    rgb:
+      _target_: il_lib.nn.features.MultiviewResNet18
+      backbone: resnet18_gn
+      views:
+        - robot_r1::robot_r1:zed_link:Camera:0
+        - robot_r1::goal::Camera:0
+      resnet_output_dim: 512
+      token_dim: 512
+      use_shared_backbone: true
+      load_pretrained: true
+      include_depth: false
+      enable_random_crop: false
+      random_crop_size: 224
+      return_last_spatial_map: false
+  feature_fusion_hidden_depth: 2
+  feature_fusion_hidden_dim: 512
+  feature_fusion_output_dim: 512
+  feature_fusion_activation: "relu"
+  feature_fusion_add_input_activation: false
+  feature_fusion_add_output_activation: true
+  action_dim: 23
+  action_keys: ${robot.action_keys}
+  action_key_dims: ${robot.action_key_dims}
+  num_latest_obs: ${num_latest_obs}
+  backbone:
+    _target_: il_lib.nn.diffusion.ConditionalUnet1D
+    input_dim: ${module.action_dim}
+    local_cond_dim: null
+    global_cond_dim: ${eval:'${module.feature_fusion_output_dim} * ${num_latest_obs}'}
+    diffusion_step_embed_dim: 128
+    down_dims: [512, 1024, 2048]
+    kernel_size: 5
+    n_groups: 8
+    cond_predict_scale: true
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: true
+    set_alpha_to_one: true
+    steps_offset: 0
+    prediction_type: epsilon
+  noise_scheduler_step_kwargs: null
+  num_denoise_steps_per_inference: 16
+  horizon: ${horizon}
+  deployed_action_steps: ${deployed_action_steps}
+  optimizer: adamw
+
+data:
+  use_action_chunks: false
+  visual_obs_types: [rgb]
+  use_task_info: false

@@ -1,0 +1,113 @@
+# @package _global_
+#
+# Diffusion Policy (UNet backbone) with goal-image conditioning. Control
+# variant: il_lib's original hyperparameters (the values inherited from
+# ``base_config_goal_image.yaml`` and ``diffusion_rgbd_unet.yaml`` before any
+# DP-alignment changes), applied to the goal-image setup.
+#
+# Hypothesis tested:
+#   Did the DP-canonical alignment of (lr, wd, bs, down_dims) we did in
+#   ``diffusion_goal_rgb_unet.yaml`` actually matter for this task? If this
+#   control reaches similar success rates, we can keep il_lib's defaults and
+#   avoid the complexity. If it lags significantly, the DP-alignment matters
+#   here too -- analogous to the ACT result.
+#
+# Differences vs. ``diffusion_goal_rgb_unet.yaml``:
+#   * ``lr``        : 1e-4   -> 7e-4    (il_lib inherited default)
+#   * ``wd``        : 1e-6   -> 0.0     (il_lib inherited default)
+#   * ``bs``        : 64     -> 128     (il_lib inherited default)
+#   * ``down_dims`` : [512, 1024, 2048] -> [64, 128]  (il_lib default UNet)
+#   * ``optimizer`` : adamw  -> adam    (il_lib default; matches existing
+#                                        ``diffusion_rgbd_unet.yaml``)
+#
+# Everything else (goal-image plumbing, RGB-only, head+goal views,
+# FrozenBatchNorm-equivalent ``resnet18_gn``, no random crop) is unchanged.
+
+arch_name: diffusion_goal_rgb_unet_il_default
+
+# ====== Policy specific ======
+horizon: 16
+num_latest_obs: 2
+deployed_action_steps: 8
+lr: 7.0e-4
+wd: 0.0
+bs: 128
+
+# ====== Policy Module ======
+module:
+  _target_: il_lib.policies.DiffusionPolicy
+  prop_dim: 37
+  prop_keys:
+    - odom/base_velocity
+    - qpos/torso
+    - qpos/left_arm
+    - qpos/left_gripper
+    - qpos/right_arm
+    - qpos/right_gripper
+    - eef/left_pos
+    - eef/left_quat
+    - eef/right_pos
+    - eef/right_quat
+  feature_extractors:
+    proprioception:
+      _target_: il_lib.nn.common.MLP
+      input_dim: ${module.prop_dim}
+      hidden_dim: 512
+      output_dim: 512
+      hidden_depth: 2
+      add_output_activation: true
+    rgb:
+      _target_: il_lib.nn.features.MultiviewResNet18
+      backbone: resnet18_gn
+      views:
+        - robot_r1::robot_r1:zed_link:Camera:0
+        - robot_r1::goal::Camera:0
+      resnet_output_dim: 512
+      token_dim: 512
+      use_shared_backbone: true
+      load_pretrained: true
+      include_depth: false
+      enable_random_crop: false
+      random_crop_size: 224
+      return_last_spatial_map: false
+  feature_fusion_hidden_depth: 2
+  feature_fusion_hidden_dim: 512
+  feature_fusion_output_dim: 512
+  feature_fusion_activation: "relu"
+  feature_fusion_add_input_activation: false
+  feature_fusion_add_output_activation: true
+  action_dim: 23
+  action_keys: ${robot.action_keys}
+  action_key_dims: ${robot.action_key_dims}
+  num_latest_obs: ${num_latest_obs}
+  backbone:
+    _target_: il_lib.nn.diffusion.ConditionalUnet1D
+    input_dim: ${module.action_dim}
+    local_cond_dim: null
+    global_cond_dim: ${eval:'${module.feature_fusion_output_dim} * ${num_latest_obs}'}
+    diffusion_step_embed_dim: 128
+    # il_lib default (much smaller than DP's [512, 1024, 2048])
+    down_dims: [64, 128]
+    kernel_size: 5
+    n_groups: 8
+    cond_predict_scale: true
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: true
+    set_alpha_to_one: true
+    steps_offset: 0
+    prediction_type: epsilon
+  noise_scheduler_step_kwargs: null
+  num_denoise_steps_per_inference: 16
+  horizon: ${horizon}
+  deployed_action_steps: ${deployed_action_steps}
+  optimizer: adam
+
+data:
+  use_action_chunks: false
+  visual_obs_types: [rgb]
+  use_task_info: false

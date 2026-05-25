@@ -1,0 +1,122 @@
+# @package _global_
+#
+# Diffusion Policy (Transformer backbone) with goal-image conditioning.
+#
+# Variant of ``diffusion_goal_rgb_unet.yaml`` that swaps the 1D UNet for a
+# Transformer-for-diffusion backbone, matching the canonical DP Transformer
+# recipe (Chi et al. 2023,
+# ``diffusion_policy/config/train_diffusion_transformer_hybrid_workspace.yaml``).
+#
+# Hyperparameters aligned to DP Transformer:
+#   * ``lr``         : 1e-4   (matches DP ``optimizer.learning_rate``)
+#   * ``wd``         : 1e-3   (matches DP ``optimizer.transformer_weight_decay``;
+#                              note this is 1000x higher than the UNet variant
+#                              -- transformers tolerate / want more L2)
+#   * ``bs``         : 64     (matches DP ``dataloader.batch_size``)
+#   * ``horizon``    : 10     (DP Transformer uses 10 vs UNet 16)
+#   * ``n_layer``    : 8, ``n_head`` : 4, ``n_emb`` : 256, ``p_drop_attn`` : 0.3
+#                              (all from canonical DP Transformer)
+#
+# Caveat: DP uses a split-weight-decay scheme (transformer_weight_decay=1e-3,
+# obs_encoder_weight_decay=1e-6) which il_lib's ``DiffusionPolicy`` does not
+# implement -- a single ``weight_decay`` is applied to all parameters. We use
+# the transformer side's value (1e-3) since the transformer dominates param
+# count. Aligning the encoder side would require code changes.
+
+arch_name: diffusion_goal_rgb_transformer
+
+# ====== Policy specific ======
+horizon: 10
+num_latest_obs: 2
+deployed_action_steps: 8
+lr: 1.0e-4
+wd: 1.0e-3
+bs: 64
+
+# ====== Policy Module ======
+module:
+  _target_: il_lib.policies.DiffusionPolicy
+  prop_dim: 37
+  prop_keys:
+    - odom/base_velocity
+    - qpos/torso
+    - qpos/left_arm
+    - qpos/left_gripper
+    - qpos/right_arm
+    - qpos/right_gripper
+    - eef/left_pos
+    - eef/left_quat
+    - eef/right_pos
+    - eef/right_quat
+  # ====== Feature Extractors ======
+  feature_extractors:
+    proprioception:
+      _target_: il_lib.nn.common.MLP
+      input_dim: ${module.prop_dim}
+      hidden_dim: 512
+      output_dim: 512
+      hidden_depth: 2
+      add_output_activation: true
+    rgb:
+      _target_: il_lib.nn.features.MultiviewResNet18
+      backbone: resnet18_gn
+      views:
+        - robot_r1::robot_r1:zed_link:Camera:0
+        - robot_r1::goal::Camera:0
+      resnet_output_dim: 512
+      token_dim: 512
+      use_shared_backbone: true
+      load_pretrained: true
+      include_depth: false
+      enable_random_crop: false
+      random_crop_size: 224
+      return_last_spatial_map: false
+  # ====== Feature Fusion ======
+  feature_fusion_hidden_depth: 2
+  feature_fusion_hidden_dim: 512
+  feature_fusion_output_dim: 512
+  feature_fusion_activation: relu
+  feature_fusion_add_input_activation: false
+  feature_fusion_add_output_activation: true
+  # ====== Action ======
+  action_dim: 23
+  action_keys: ${robot.action_keys}
+  action_key_dims: ${robot.action_key_dims}
+  num_latest_obs: ${num_latest_obs}
+  # ====== Backbone ======
+  backbone:
+    _target_: il_lib.nn.diffusion.TransformerForDiffusion
+    input_dim: ${module.action_dim}
+    output_dim: ${module.action_dim}
+    horizon: ${horizon}
+    n_obs_steps: ${num_latest_obs}
+    cond_dim: ${module.feature_fusion_output_dim}
+    # Canonical DP Transformer config; ``diffusion_state_transformer.yaml``
+    # used ``n_layer=2`` which is much smaller than DP's 8.
+    n_layer: 8
+    n_head: 4
+    n_emb: 256
+    p_drop_emb: 0.0
+    p_drop_attn: 0.3
+    n_cond_layers: 0  # >0: use transformer encoder for cond, otherwise MLP
+  # ====== Diffusion ======
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: true
+    set_alpha_to_one: true
+    steps_offset: 0
+    prediction_type: epsilon
+  noise_scheduler_step_kwargs: null
+  num_denoise_steps_per_inference: 16
+  horizon: ${horizon}
+  deployed_action_steps: ${deployed_action_steps}
+  optimizer: adamw
+
+data:
+  use_action_chunks: false
+  visual_obs_types: [rgb]
+  use_task_info: false

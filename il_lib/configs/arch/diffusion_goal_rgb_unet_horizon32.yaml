@@ -1,0 +1,115 @@
+# @package _global_
+#
+# Diffusion Policy (UNet backbone) with goal-image conditioning, doubled
+# action chunk horizon.
+#
+# Hypothesis tested:
+#   For ACT, ``horizon=60`` (3x longer than the il_lib default of 20) was
+#   critical and only helped in combination with the canonical optimizer
+#   alignment (the "full og" sweep result on object scaling: 0.92 vs 0.35
+#   for og-optimizer-only). The reasoning was that il_lib's data is at 30 Hz
+#   vs ACT's 50 Hz, so a 20-step chunk was effectively 2/3 of ACT's
+#   100-step chunk in wall-clock time. The diffusion canonical horizon is
+#   16 (vs 8000-epoch ALOHA dataset); whether the same wall-clock-time
+#   argument applies to diffusion is unclear, so we test by doubling to 32.
+#
+# Differences vs. ``diffusion_goal_rgb_unet.yaml``:
+#   * ``horizon`` : 16 -> 32
+#   * ``deployed_action_steps`` : 8 -> 16 (kept at half the horizon, same
+#                                          ratio as the canonical DP recipe)
+#
+# Caveats:
+#   * Longer horizons require more denoising compute per inference and more
+#     VRAM during training. Should still fit comfortably on a titanrtx.
+#   * Diffusion's denoising over a longer chunk is fundamentally different
+#     from ACT's transformer extrapolating action tokens. If the chunk-length
+#     hypothesis was specific to the CVAE / latent-action dynamics in ACT,
+#     this ablation will show no improvement and we can deprioritize it.
+
+arch_name: diffusion_goal_rgb_unet_horizon32
+
+# ====== Policy specific ======
+horizon: 32
+num_latest_obs: 2
+deployed_action_steps: 16
+lr: 1.0e-4
+wd: 1.0e-6
+bs: 64
+
+# ====== Policy Module ======
+module:
+  _target_: il_lib.policies.DiffusionPolicy
+  prop_dim: 37
+  prop_keys:
+    - odom/base_velocity
+    - qpos/torso
+    - qpos/left_arm
+    - qpos/left_gripper
+    - qpos/right_arm
+    - qpos/right_gripper
+    - eef/left_pos
+    - eef/left_quat
+    - eef/right_pos
+    - eef/right_quat
+  feature_extractors:
+    proprioception:
+      _target_: il_lib.nn.common.MLP
+      input_dim: ${module.prop_dim}
+      hidden_dim: 512
+      output_dim: 512
+      hidden_depth: 2
+      add_output_activation: true
+    rgb:
+      _target_: il_lib.nn.features.MultiviewResNet18
+      backbone: resnet18_gn
+      views:
+        - robot_r1::robot_r1:zed_link:Camera:0
+        - robot_r1::goal::Camera:0
+      resnet_output_dim: 512
+      token_dim: 512
+      use_shared_backbone: true
+      load_pretrained: true
+      include_depth: false
+      enable_random_crop: false
+      random_crop_size: 224
+      return_last_spatial_map: false
+  feature_fusion_hidden_depth: 2
+  feature_fusion_hidden_dim: 512
+  feature_fusion_output_dim: 512
+  feature_fusion_activation: "relu"
+  feature_fusion_add_input_activation: false
+  feature_fusion_add_output_activation: true
+  action_dim: 23
+  action_keys: ${robot.action_keys}
+  action_key_dims: ${robot.action_key_dims}
+  num_latest_obs: ${num_latest_obs}
+  backbone:
+    _target_: il_lib.nn.diffusion.ConditionalUnet1D
+    input_dim: ${module.action_dim}
+    local_cond_dim: null
+    global_cond_dim: ${eval:'${module.feature_fusion_output_dim} * ${num_latest_obs}'}
+    diffusion_step_embed_dim: 128
+    down_dims: [512, 1024, 2048]
+    kernel_size: 5
+    n_groups: 8
+    cond_predict_scale: true
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: true
+    set_alpha_to_one: true
+    steps_offset: 0
+    prediction_type: epsilon
+  noise_scheduler_step_kwargs: null
+  num_denoise_steps_per_inference: 16
+  horizon: ${horizon}
+  deployed_action_steps: ${deployed_action_steps}
+  optimizer: adamw
+
+data:
+  use_action_chunks: false
+  visual_obs_types: [rgb]
+  use_task_info: false

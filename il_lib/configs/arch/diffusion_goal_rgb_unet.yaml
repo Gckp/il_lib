@@ -1,0 +1,171 @@
+# @package _global_
+#
+# Diffusion Policy (UNet backbone) with goal-image conditioning.
+#
+# Mirrors the ``act_goal.yaml`` adaptation for diffusion: drops wrist cameras
+# and the depth modality, registers the goal image as an additional RGB view
+# in the multi-view backbone (head + goal), and routes the per-episode goal
+# image through ``BehaviorIterableDatasetWithGoalImage`` (training) and
+# ``PolicyWrapperWithGoalImage`` (eval) -- both wired up by
+# ``base_config_goal_image.yaml``.
+#
+# Hyperparameters are aligned to the canonical Diffusion Policy (Chi et al.
+# 2023) image-UNet recipe (``diffusion_policy/config/train_diffusion_unet_image_workspace.yaml``)
+# rather than il_lib's existing diffusion_rgbd_unet defaults, after the ACT
+# adaptation showed that il_lib's base_config defaults can be off by enough to
+# break the policy on goal-perturbed tasks. The four most consequential
+# divergences from il_lib defaults are documented below.
+#
+# Previous il_lib defaults (inherited from ``base_config_goal_image.yaml`` and
+# ``diffusion_rgbd_unet.yaml``; do NOT restore individually):
+#   * ``lr``        : 7e-4   (inherited base; 7x higher than canonical DP)
+#   * ``wd``        : 0.0    (inherited base; ~equivalent to DP)
+#   * ``bs``        : 128    (inherited base; 2x larger than canonical DP)
+#   * ``down_dims`` : [64, 128]  (under-parameterised; DP uses [512, 1024, 2048])
+#
+# Canonical DP values used here:
+#   * ``lr``        : 1e-4   (matches DP ``optimizer.lr``)
+#   * ``wd``        : 1e-6   (matches DP ``optimizer.weight_decay``)
+#   * ``bs``        : 64     (matches DP ``dataloader.batch_size``)
+#   * ``down_dims`` : [512, 1024, 2048]  (matches DP UNet full capacity)
+#
+# Other DP-aligned choices (already present in il_lib's diffusion configs):
+#   * ``horizon=16``, ``num_latest_obs=2``, ``deployed_action_steps=8``
+#   * DDIM noise scheduler with ``num_train_timesteps=100``
+#   * ``num_denoise_steps_per_inference=16`` (DDIM speedup vs DDPM x100)
+#   * ResNet18 with GroupNorm (``resnet18_gn``); GN is required if EMA is
+#     added later, BN can break with EMA
+#   * ``squaredcos_cap_v2`` beta schedule, ``epsilon`` prediction
+#
+# Caveats / known divergences from DP we did NOT adopt:
+#   * EMA: DP uses EMA over policy weights (decay 0.75). il_lib's
+#     ``DiffusionPolicy`` does not implement EMA. Adding it is a small code
+#     change; if results are weak this is the next thing to try.
+#   * Optimizer betas: DP uses ``[0.95, 0.999]`` (UNet). il_lib's
+#     ``DiffusionPolicy.configure_optimizers`` uses PyTorch defaults
+#     (``[0.9, 0.999]``). Minor; not exposed as a config option.
+#   * ``random_crop``: DP uses ``True`` (crop 76 from 96). We follow ACT-goal
+#     and use ``false`` because cropping a static reference goal image is
+#     undesirable. If head-cam augmentation matters, the
+#     ``MultiviewResNet18`` would need per-view crop control.
+#   * ``use_shared_backbone``: DP uses ``False`` (separate ResNet per view).
+#     We follow ACT-goal and use ``true`` -- known to work end-to-end and
+#     halves visual-encoder params. Worth ablating if results plateau.
+#
+# Caveat (same as ``act_goal.yaml``):
+#   Canonical DP uses a cosine schedule but trains for ``num_epochs=8000``.
+#   il_lib inherits ``lr_cosine_steps: 100000`` from
+#   ``base_config_goal_image.yaml`` which is not adjusted here. With ``bs=64``
+#   the steps-per-epoch ratio is 2x the previous ``bs=128`` setup, so the
+#   cosine schedule covers half as many epochs. Override ``lr_cosine_steps``
+#   on the CLI if training looks under-cooked.
+
+arch_name: diffusion_goal_rgb_unet
+
+# ====== Policy specific ======
+horizon: 16
+num_latest_obs: 2
+deployed_action_steps: 8
+lr: 1.0e-4
+wd: 1.0e-6
+bs: 64
+
+# ====== Policy Module ======
+module:
+  _target_: il_lib.policies.DiffusionPolicy
+  prop_dim: 37
+  prop_keys:
+    - odom/base_velocity
+    - qpos/torso
+    - qpos/left_arm
+    - qpos/left_gripper
+    - qpos/right_arm
+    - qpos/right_gripper
+    - eef/left_pos
+    - eef/left_quat
+    - eef/right_pos
+    - eef/right_quat
+  # ====== Feature Extractors ======
+  feature_extractors:
+    proprioception:
+      _target_: il_lib.nn.common.MLP
+      input_dim: ${module.prop_dim}
+      hidden_dim: 512
+      output_dim: 512
+      hidden_depth: 2
+      add_output_activation: true
+    rgb:
+      _target_: il_lib.nn.features.MultiviewResNet18
+      backbone: resnet18_gn
+      # Two views: head camera (current obs) + goal image (per-episode
+      # reference). Wrist cameras are intentionally dropped to match the
+      # ACT-goal pipeline. The goal view key must match
+      # ``goal_view_name`` from ``base_config_goal_image.yaml``.
+      views:
+        - robot_r1::robot_r1:zed_link:Camera:0
+        - robot_r1::goal::Camera:0
+      resnet_output_dim: 512
+      token_dim: 512
+      use_shared_backbone: true
+      load_pretrained: true
+      include_depth: false
+      # Static goal reference image should not be randomly cropped per sample;
+      # matches ACT-goal convention. Re-enable per-view if augmentation on the
+      # head camera turns out to matter.
+      enable_random_crop: false
+      random_crop_size: 224
+      return_last_spatial_map: false
+  # ====== Feature Fusion ======
+  feature_fusion_hidden_depth: 2
+  feature_fusion_hidden_dim: 512
+  feature_fusion_output_dim: 512
+  feature_fusion_activation: "relu"
+  feature_fusion_add_input_activation: false
+  feature_fusion_add_output_activation: true
+  # ====== Action ======
+  action_dim: 23
+  action_keys: ${robot.action_keys}
+  action_key_dims: ${robot.action_key_dims}
+  num_latest_obs: ${num_latest_obs}
+  # ====== Backbone ======
+  backbone:
+    _target_: il_lib.nn.diffusion.ConditionalUnet1D
+    input_dim: ${module.action_dim}
+    local_cond_dim: null
+    global_cond_dim: ${eval:'${module.feature_fusion_output_dim} * ${num_latest_obs}'}
+    diffusion_step_embed_dim: 128
+    # Canonical DP UNet capacity (vs il_lib default ``[64, 128]``). The
+    # smaller default is significantly under-parameterised for the 23-dim
+    # action chunk and goal-conditioned multi-view inputs.
+    down_dims: [512, 1024, 2048]
+    kernel_size: 5
+    n_groups: 8
+    cond_predict_scale: true
+  # ====== Diffusion ======
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddim.DDIMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: true
+    set_alpha_to_one: true
+    steps_offset: 0
+    prediction_type: epsilon # or sample
+  noise_scheduler_step_kwargs: null
+  # DDIM lets us run inference in 16 steps instead of the 100 used at
+  # training; matches il_lib's existing diffusion configs and is the standard
+  # speedup over DDPM.
+  num_denoise_steps_per_inference: 16
+  horizon: ${horizon}
+  deployed_action_steps: ${deployed_action_steps}
+  # Canonical DP uses AdamW (with betas=[0.95, 0.999]). il_lib's
+  # ``DiffusionPolicy`` supports ``adam`` and ``adamw``; pick ``adamw`` to
+  # match DP. Betas are not exposed as a config kwarg.
+  optimizer: adamw
+
+data:
+  use_action_chunks: false
+  # RGB-only to match the goal-image pipeline.
+  visual_obs_types: [rgb]
+  use_task_info: false
