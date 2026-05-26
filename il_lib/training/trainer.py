@@ -99,6 +99,18 @@ class Trainer:
     def generate_run_name(self, cfg):
         return cfg.run_name + "_" + time.strftime("%Y%m%d-%H%M%S")
 
+    @staticmethod
+    def _wandb_run_id(run_name: str, max_len: int = 128) -> str:
+        """wandb enforces a 128-char limit on run ``id``; our on-disk run dirs
+        append a timestamp and can exceed that for long Hydra ``run_name`` values."""
+        if len(run_name) <= max_len:
+            return run_name
+        import hashlib
+
+        digest = hashlib.sha1(run_name.encode()).hexdigest()[:8]
+        keep = max_len - len(digest) - 1
+        return f"{run_name[:keep]}_{digest}"
+
     def _monkey_patch_add_info(self, obj):
         """
         Add useful info to module and data_module so they can access directly
@@ -134,12 +146,15 @@ class Trainer:
                 pl_loggers.CSVLogger(self.run_dir, name="logs", version=""),
             ]
         if cfg.use_wandb:
+            wandb_name = cfg.wandb_run_name
+            if len(wandb_name) > 128:
+                wandb_name = self._wandb_run_id(wandb_name)
             loggers.append(
                 pl_loggers.WandbLogger(
-                    name=cfg.wandb_run_name,
+                    name=wandb_name,
                     project=cfg.wandb_project,
                     group=cfg.wandb_group,
-                    id=self.run_name,
+                    id=self._wandb_run_id(self.run_name),
                     save_dir=self.run_dir,
                 )
             )
