@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import Any
 
 STEP_VAL_L1_RE = re.compile(r"^step(\d+)-val_l1_([0-9.]+)\.pth$")
+GCBC_CKPT_RE = re.compile(r"^checkpoint_(\d+)\.pt$")
 
 TRAIN_LOSS_COLS = ("train/loss", "train/loss_epoch", "train_loss")
 VAL_LOSS_COLS = ("val/loss", "val/loss_epoch", "val_loss")
@@ -165,6 +166,22 @@ def discover_checkpoints(ckpt_dir: Path) -> list[tuple[int, str, float | None]]:
     return found
 
 
+def discover_checkpoints_gcbc(ckpt_dir: Path) -> list[tuple[int, str, float | None]]:
+    """GCBC layout: checkpoint_<step>.pt files directly in the run dir.
+
+    Returns [(step, filename, None), ...] sorted by step (no val_l1 in name).
+    """
+    found: list[tuple[int, str, float | None]] = []
+    for p in sorted(ckpt_dir.iterdir()):
+        if not p.is_file() or p.suffix != ".pt":
+            continue
+        m = GCBC_CKPT_RE.match(p.name)
+        if m:
+            found.append((int(m.group(1)), p.name, None))
+    found.sort(key=lambda x: x[0])
+    return found
+
+
 def load_eval_summary(results_dir: Path, step: int, is_last: bool) -> dict[str, Any]:
     ckpt_key = "last" if is_last else str(step)
     summary_path = results_dir / f"ckpt_{ckpt_key}" / "summary.json"
@@ -189,17 +206,36 @@ def infer_results_dir(run_dir: Path, project_root: Path) -> Path:
     return project_root / "results" / run_folder
 
 
+def detect_ckpt_format(run_dir: Path) -> str:
+    """Return 'lightning' if run_dir/ckpt exists, else 'gcbc' if checkpoint_*.pt."""
+    if (run_dir / "ckpt").is_dir():
+        return "lightning"
+    if any(GCBC_CKPT_RE.match(p.name) for p in run_dir.iterdir() if p.is_file()):
+        return "gcbc"
+    return "lightning"
+
+
 def build_payload(
     run_dir: Path,
     results_dir: Path,
     task_id: int | None = None,
     task_name: str | None = None,
+    ckpt_format: str = "auto",
 ) -> dict[str, Any]:
     run_dir = run_dir.resolve()
     results_dir = results_dir.resolve()
-    ckpt_dir = run_dir / "ckpt"
-    if not ckpt_dir.is_dir():
-        raise FileNotFoundError(f"Missing ckpt dir: {ckpt_dir}")
+
+    if ckpt_format == "auto":
+        ckpt_format = detect_ckpt_format(run_dir)
+
+    if ckpt_format == "gcbc":
+        ckpt_dir = run_dir
+        checkpoints = discover_checkpoints_gcbc(ckpt_dir)
+    else:
+        ckpt_dir = run_dir / "ckpt"
+        if not ckpt_dir.is_dir():
+            raise FileNotFoundError(f"Missing ckpt dir: {ckpt_dir}")
+        checkpoints = discover_checkpoints(ckpt_dir)
 
     run_folder = run_dir.name
     if task_id is None or task_name is None:
@@ -211,7 +247,7 @@ def build_payload(
     metrics_by_step = load_metrics_by_step(metrics_csv)
 
     points: list[dict[str, Any]] = []
-    for step, filename, val_l1_name in discover_checkpoints(ckpt_dir):
+    for step, filename, val_l1_name in checkpoints:
         is_last = filename == "last.pth"
         m = lookup_metrics(metrics_by_step, step)
         val_l1 = val_l1_name if val_l1_name is not None else m.get("val_l1")
@@ -235,6 +271,7 @@ def build_payload(
         "run_dir": str(run_dir),
         "run_folder": run_folder,
         "results_dir": str(results_dir),
+        "ckpt_format": ckpt_format,
         "task_id": task_id,
         "task_name": task_name,
         "metrics_csv": str(metrics_csv) if metrics_csv.is_file() else None,
@@ -263,6 +300,13 @@ def main() -> None:
     )
     parser.add_argument("--task-id", type=int, default=None)
     parser.add_argument("--task-name", default=None)
+    parser.add_argument(
+        "--ckpt-format",
+        choices=("auto", "lightning", "gcbc"),
+        default="auto",
+        help="Checkpoint layout: 'lightning' (run_dir/ckpt/step*-val_l1_*.pth), "
+        "'gcbc' (run_dir/checkpoint_*.pt), or 'auto' to detect.",
+    )
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -282,6 +326,7 @@ def main() -> None:
         results_dir=results_dir,
         task_id=args.task_id,
         task_name=args.task_name,
+        ckpt_format=args.ckpt_format,
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
