@@ -105,12 +105,29 @@ def _pick_col(row: dict[str, str], candidates: tuple[str, ...]) -> float | None:
     return None
 
 
-def load_metrics_by_step(metrics_csv: Path) -> dict[int, dict[str, float | None]]:
-    """Index CSV metrics by global step (last row wins per step)."""
-    if not metrics_csv.is_file():
-        return {}
+def load_metric_series(metrics_csv: Path) -> dict[str, list[tuple[int, float]]]:
+    """Per-metric (step, value) series, sorted by step.
 
-    by_step: dict[int, dict[str, float | None]] = {}
+    Lightning's CSVLogger writes train and val metrics on separate rows that
+    can share the same ``step`` (e.g. an lr/train row and a ``val/*`` row both
+    at step 1999), and leaves the other columns blank. Indexing the whole row
+    by step and taking the last row would drop ``train/loss`` whenever a blank
+    val row follows it. So we collect each metric independently, keeping only
+    the rows where that metric is actually present.
+    """
+    series: dict[str, list[tuple[int, float]]] = {
+        "train_loss": [],
+        "val_loss": [],
+        "val_l1": [],
+    }
+    if not metrics_csv.is_file():
+        return series
+
+    cols_by_key = {
+        "train_loss": TRAIN_LOSS_COLS,
+        "val_loss": VAL_LOSS_COLS,
+        "val_l1": VAL_L1_COLS,
+    }
     with metrics_csv.open(newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -118,24 +135,25 @@ def load_metrics_by_step(metrics_csv: Path) -> dict[int, dict[str, float | None]
             if step is None:
                 continue
             step_i = int(step)
-            by_step[step_i] = {
-                "train_loss": _pick_col(row, TRAIN_LOSS_COLS),
-                "val_loss": _pick_col(row, VAL_LOSS_COLS),
-                "val_l1": _pick_col(row, VAL_L1_COLS),
-            }
-    return by_step
+            for key, cols in cols_by_key.items():
+                v = _pick_col(row, cols)
+                if v is not None:
+                    series[key].append((step_i, v))
+
+    for key in series:
+        series[key].sort(key=lambda sv: sv[0])
+    return series
 
 
-def lookup_metrics(
-    metrics_by_step: dict[int, dict[str, float | None]], step: int
-) -> dict[str, float | None]:
-    """Exact step match, else nearest logged step <= checkpoint step."""
-    if step in metrics_by_step:
-        return metrics_by_step[step]
-    prior = [s for s in metrics_by_step if s <= step]
-    if not prior:
-        return {"train_loss": None, "val_loss": None, "val_l1": None}
-    return metrics_by_step[max(prior)]
+def lookup_metric(series: list[tuple[int, float]], step: int) -> float | None:
+    """Value at the largest logged step <= ``step`` (else None)."""
+    best: float | None = None
+    for s, v in series:
+        if s <= step:
+            best = v
+        else:
+            break
+    return best
 
 
 def discover_checkpoints(ckpt_dir: Path) -> list[tuple[int, str, float | None]]:
@@ -244,16 +262,17 @@ def build_payload(
         task_name = task_name if task_name is not None else parsed_name
 
     metrics_csv = run_dir / "logs" / "metrics.csv"
-    metrics_by_step = load_metrics_by_step(metrics_csv)
+    metric_series = load_metric_series(metrics_csv)
 
     points: list[dict[str, Any]] = []
     for step, filename, val_l1_name in checkpoints:
         is_last = filename == "last.pth"
-        m = lookup_metrics(metrics_by_step, step)
-        val_l1 = val_l1_name if val_l1_name is not None else m.get("val_l1")
-        val_loss = m.get("val_loss")
-        if val_loss is None:
-            val_loss = val_l1
+        train_loss = lookup_metric(metric_series["train_loss"], step)
+        csv_val_loss = lookup_metric(metric_series["val_loss"], step)
+        csv_val_l1 = lookup_metric(metric_series["val_l1"], step)
+
+        val_l1 = val_l1_name if val_l1_name is not None else csv_val_l1
+        val_loss = csv_val_loss if csv_val_loss is not None else val_l1
 
         eval_data = load_eval_summary(results_dir, step, is_last=is_last)
         point: dict[str, Any] = {
@@ -262,7 +281,7 @@ def build_payload(
             "checkpoint_path": str(ckpt_dir / filename),
             "val_l1": val_l1,
             "val_loss": val_loss,
-            "train_loss": m.get("train_loss"),
+            "train_loss": train_loss,
             **eval_data,
         }
         points.append(point)
