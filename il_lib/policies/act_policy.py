@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import deque
+from einops import rearrange
 from hydra.utils import instantiate
 from il_lib.optim import CosineScheduleFunction, default_optimizer_groups
 from il_lib.nn.transformers import (
@@ -45,6 +46,12 @@ class ACT(BasePolicy):
         pre_norm: bool,
         kl_weight: float,
         temporal_ensemble: bool,
+        # Number of stacked observation-history frames (incl. current) the
+        # policy conditions on. Must match the data loader's
+        # ``obs_window_size`` (= ``num_latest_obs``). 1 reproduces the original
+        # single-frame ACT. >1 folds each past frame's image features into
+        # extra transformer tokens and concatenates the per-frame proprio.
+        num_latest_obs: int = 1,
         # If False, proprio is replaced with zeros in forward (vision-only); the
         # proprio linear layers are frozen and omitted from the optimizer.
         use_proprio: bool = True,
@@ -69,6 +76,7 @@ class ACT(BasePolicy):
         self._prop_keys = prop_keys
         self._action_keys = action_keys 
         self.action_dim = action_dim
+        self.num_latest_obs = num_latest_obs
         self._features = features
         self._use_depth = obs_backbone.include_depth
         self.obs_backbone = instantiate(obs_backbone)
@@ -102,12 +110,13 @@ class ACT(BasePolicy):
         self.action_head = nn.Linear(hidden_dim, action_dim)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         self.input_proj = nn.Conv2d(obs_backbone.resnet_output_dim, hidden_dim, kernel_size=1)
-        self.input_proj_robot_state = nn.Linear(prop_dim, hidden_dim)
+        # Proprio token concatenates all ``num_latest_obs`` history frames.
+        self.input_proj_robot_state = nn.Linear(prop_dim * num_latest_obs, hidden_dim)
         # encoder extra parameters
         self.latent_dim = 32 # final size of latent z
         self.cls_embed = nn.Embedding(1, hidden_dim) # extra cls token embedding
         self.encoder_action_proj = nn.Linear(action_dim, hidden_dim) # project action to embedding
-        self.encoder_prop_proj = nn.Linear(prop_dim, hidden_dim) # project prop to embedding
+        self.encoder_prop_proj = nn.Linear(prop_dim * num_latest_obs, hidden_dim) # project prop history to embedding
         self.latent_proj = nn.Linear(hidden_dim, self.latent_dim * 2)  # project hidden state to latent std, var
         self.register_buffer('pos_table', self._get_sinusoid_encoding_table(1+1+num_queries, hidden_dim)) # [CLS], qpos, a_seq
         # decoder extra parameters
@@ -149,8 +158,10 @@ class ACT(BasePolicy):
             else:
                 prop_obs.append(obs[prop_key])
         prop_obs = torch.cat(prop_obs, dim=-1)  # (B, L, Prop_dim)
-        # flatten first two dims
-        prop_obs = prop_obs.reshape(-1, prop_obs.shape[-1])  # (B * L, Prop_dim)
+        # Concatenate the L observation-history frames into a single proprio
+        # vector per sample, so proprio stays one transformer token whose dim
+        # is ``prop_dim * num_latest_obs`` (matches the proprio projections).
+        prop_obs = prop_obs.reshape(bs, -1)  # (B, L * Prop_dim)
         if not self._use_proprio:
             # Zero the raw proprio input as a first line of defence. Note this
             # alone is NOT sufficient: ``encoder_prop_proj`` and
@@ -202,10 +213,15 @@ class ACT(BasePolicy):
         all_cam_features = []
         all_cam_pos = []
         vs = obs["rgbd"] if self._use_depth else obs["rgb"]
-        resnet_output = self.obs_backbone(vs)  # dict of (B, C, H, W)
+        resnet_output = self.obs_backbone(vs)  # dict of (B * L, C, H, W)
         for features in resnet_output.values():
-            pos = self.position_embedding(features)
-            all_cam_features.append(self.input_proj(features))
+            feat = self.input_proj(features)  # (B * L, hidden, H, W)
+            # Fold the L observation-history frames into the token (width) axis
+            # so each past frame contributes its own spatial tokens to the
+            # transformer (alongside the multi-view concatenation below).
+            feat = rearrange(feat, "(b l) e h w -> b e h (l w)", b=bs)
+            pos = self.position_embedding(feat)
+            all_cam_features.append(feat)
             all_cam_pos.append(pos)
         # proprioception features
         proprio_input = self.input_proj_robot_state(prop_obs)
