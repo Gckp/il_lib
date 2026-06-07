@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Plot rollout success rate and training/validation loss vs training step.
+"""Plot steps-weighted rollout success and train/val loss vs training step.
 
 Reads ``all_checkpoints.json`` produced by ``build_all_checkpoints_json.py``.
+The right axis shows ``steps_weighted_success_rate`` (success rate inversely
+weighted by mean episode steps), and the loss axis uses a log scale so small
+validation-loss variations are visible.
 
 Example:
     python il/il_lib/plot_rollout_vs_loss.py \\
@@ -32,12 +35,12 @@ def plot_rollout_vs_loss(
     show: bool = False,
 ) -> None:
     steps = [p["step"] for p in points]
-    success = [p.get("success_rate") for p in points]
+    swsr = [p.get("steps_weighted_success_rate") for p in points]
     train_loss = [p.get("train_loss") for p in points]
     val_loss = [p.get("val_loss") for p in points]
     val_l1 = [p.get("val_l1") for p in points]
 
-    has_success = any(s is not None for s in success)
+    has_success = any(s is not None for s in swsr)
     has_train = any(v is not None for v in train_loss)
     has_val = any(v is not None for v in val_loss)
     has_val_l1 = any(v is not None for v in val_l1)
@@ -73,8 +76,13 @@ def plot_rollout_vs_loss(
         )
 
     ax_loss.set_xlabel("training step")
-    ax_loss.set_ylabel("loss")
-    ax_loss.grid(True, alpha=0.3)
+    ax_loss.set_ylabel("loss (log scale)")
+    # Log scale makes small val-loss variations visible. Guard against
+    # non-positive values, which a log axis can't represent.
+    loss_vals = [v for v in (train_loss + val_loss + val_l1) if v is not None]
+    if loss_vals and min(loss_vals) > 0:
+        ax_loss.set_yscale("log")
+    ax_loss.grid(True, alpha=0.3, which="both")
 
     title_parts = [meta.get("run_folder", "checkpoint sweep")]
     if meta.get("task_name"):
@@ -87,14 +95,15 @@ def plot_rollout_vs_loss(
         ax_success = ax_loss.twinx()
         ax_success.plot(
             steps,
-            success,
+            swsr,
             marker="D",
             linewidth=2.0,
-            label="rollout success rate",
+            label="steps-weighted success rate",
             color="#2ca02c",
         )
-        ax_success.set_ylabel("rollout success rate")
-        ax_success.set_ylim(-0.05, 1.05)
+        ax_success.set_ylabel("steps-weighted success rate\n(success rate / mean episode steps)")
+        # Unbounded metric (not in [0, 1]); autoscale with a small floor at 0.
+        ax_success.set_ylim(bottom=0)
         s_lines, s_labels = ax_success.get_legend_handles_labels()
         lines += s_lines
         labels += s_labels

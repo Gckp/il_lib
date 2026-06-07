@@ -25,6 +25,8 @@ Output schema (``points`` sorted by training step, whatever intervals exist):
           "success_rate": 0.65,
           "n_success": 13,
           "n_episodes": 20,
+          "mean_episode_steps": 312.4,
+          "steps_weighted_success_rate": 0.00208,
           "evaluated": true
         },
         ...
@@ -275,6 +277,18 @@ def build_payload(
         val_loss = csv_val_loss if csv_val_loss is not None else val_l1
 
         eval_data = load_eval_summary(results_dir, step, is_last=is_last)
+
+        # Efficiency-aware score: success rate inversely weighted by how long
+        # episodes ran on average (faster successes score higher). ``None`` when
+        # the checkpoint has not been evaluated or no steps were recorded; 0.0 is
+        # a valid value (evaluated but never succeeded).
+        success_rate = eval_data.get("success_rate")
+        mean_steps = eval_data.get("mean_episode_steps")
+        if success_rate is not None and mean_steps:
+            steps_weighted = success_rate / mean_steps
+        else:
+            steps_weighted = None
+
         point: dict[str, Any] = {
             "step": step,
             "checkpoint_file": filename,
@@ -283,6 +297,7 @@ def build_payload(
             "val_loss": val_loss,
             "train_loss": train_loss,
             **eval_data,
+            "steps_weighted_success_rate": steps_weighted,
         }
         points.append(point)
 
