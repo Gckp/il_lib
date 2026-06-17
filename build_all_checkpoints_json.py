@@ -14,6 +14,8 @@ Output schema (``points`` sorted by training step, whatever intervals exist):
       "task_id": 53,
       "task_name": "object_scaling",
       "metrics_csv": ".../logs/metrics.csv",
+      "val_loss_vs_swsr_correlation": -0.82,
+      "val_loss_vs_swsr_correlation_n": 14,
       "points": [
         {
           "step": 5000,
@@ -145,6 +147,28 @@ def load_metric_series(metrics_csv: Path) -> dict[str, list[tuple[int, float]]]:
     for key in series:
         series[key].sort(key=lambda sv: sv[0])
     return series
+
+
+def pearson_correlation(
+    xs: list[float], ys: list[float]
+) -> float | None:
+    """Pearson correlation coefficient between two equal-length series.
+
+    Returns ``None`` when there are fewer than two paired samples or when
+    either series has zero variance (correlation undefined). Implemented by
+    hand to avoid pulling in numpy/scipy as a dependency for this script.
+    """
+    n = len(xs)
+    if n < 2 or n != len(ys):
+        return None
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    var_x = sum((x - mean_x) ** 2 for x in xs)
+    var_y = sum((y - mean_y) ** 2 for y in ys)
+    if var_x <= 0 or var_y <= 0:
+        return None
+    return cov / (var_x ** 0.5 * var_y ** 0.5)
 
 
 def lookup_metric(series: list[tuple[int, float]], step: int) -> float | None:
@@ -301,6 +325,20 @@ def build_payload(
         }
         points.append(point)
 
+    # Correlation between validation loss and the steps-weighted success rate
+    # across all checkpoints that have both values. A strong negative value
+    # means lower val loss tracks higher (efficiency-weighted) success, i.e.
+    # val loss is a useful model-selection proxy for this run.
+    corr_pairs = [
+        (p["val_loss"], p["steps_weighted_success_rate"])
+        for p in points
+        if p.get("val_loss") is not None
+        and p.get("steps_weighted_success_rate") is not None
+    ]
+    swsr_corr = pearson_correlation(
+        [a for a, _ in corr_pairs], [b for _, b in corr_pairs]
+    )
+
     return {
         "run_dir": str(run_dir),
         "run_folder": run_folder,
@@ -311,6 +349,8 @@ def build_payload(
         "metrics_csv": str(metrics_csv) if metrics_csv.is_file() else None,
         "n_checkpoints": len(points),
         "n_evaluated": sum(1 for p in points if p.get("evaluated")),
+        "val_loss_vs_swsr_correlation": swsr_corr,
+        "val_loss_vs_swsr_correlation_n": len(corr_pairs),
         "points": points,
     }
 
@@ -369,7 +409,13 @@ def main() -> None:
 
     n_eval = payload["n_evaluated"]
     n_total = payload["n_checkpoints"]
+    corr = payload["val_loss_vs_swsr_correlation"]
+    corr_n = payload["val_loss_vs_swsr_correlation_n"]
+    corr_str = f"{corr:.3f}" if corr is not None else "n/a"
     print(f"Wrote {output_path} ({n_total} checkpoints, {n_eval} with rollout eval)")
+    print(
+        f"  corr(val_loss, steps_weighted_success_rate) = {corr_str} (n={corr_n})"
+    )
 
 
 if __name__ == "__main__":

@@ -4,7 +4,9 @@
 Reads ``all_checkpoints.json`` produced by ``build_all_checkpoints_json.py``.
 The right axis shows ``steps_weighted_success_rate`` (success rate inversely
 weighted by mean episode steps), and the loss axis uses a log scale so small
-validation-loss variations are visible.
+validation-loss variations are visible. The Pearson correlation between
+validation loss and the steps-weighted success rate is annotated at the bottom
+of the plot (read from the JSON, or computed from the points as a fallback).
 
 Example:
     python il/il_lib/plot_rollout_vs_loss.py \\
@@ -26,6 +28,40 @@ def load_points(path: Path) -> tuple[dict, list[dict]]:
         data = json.load(f)
     points = sorted(data.get("points", []), key=lambda p: p["step"])
     return data, points
+
+
+def pearson_correlation(xs: list[float], ys: list[float]) -> float | None:
+    """Pearson r between two equal-length series (None if undefined)."""
+    n = len(xs)
+    if n < 2 or n != len(ys):
+        return None
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    var_x = sum((x - mean_x) ** 2 for x in xs)
+    var_y = sum((y - mean_y) ** 2 for y in ys)
+    if var_x <= 0 or var_y <= 0:
+        return None
+    return cov / (var_x ** 0.5 * var_y ** 0.5)
+
+
+def resolve_correlation(meta: dict, points: list[dict]) -> tuple[float | None, int]:
+    """Use the precomputed correlation from the JSON, else compute it here.
+
+    Older ``all_checkpoints.json`` files (built before correlation was added)
+    won't carry the field, so fall back to computing it from the points.
+    """
+    pairs = [
+        (p.get("val_loss"), p.get("steps_weighted_success_rate"))
+        for p in points
+        if p.get("val_loss") is not None
+        and p.get("steps_weighted_success_rate") is not None
+    ]
+    n = meta.get("val_loss_vs_swsr_correlation_n", len(pairs))
+    if "val_loss_vs_swsr_correlation" in meta:
+        return meta.get("val_loss_vs_swsr_correlation"), n
+    corr = pearson_correlation([a for a, _ in pairs], [b for _, b in pairs])
+    return corr, len(pairs)
 
 
 def plot_rollout_vs_loss(
@@ -111,7 +147,24 @@ def plot_rollout_vs_loss(
     if lines:
         ax_loss.legend(lines, labels, loc="best")
 
-    fig.tight_layout()
+    # Annotate the val-loss vs steps-weighted-success-rate correlation at the
+    # bottom of the figure (a strong negative r means val loss is a good
+    # model-selection proxy for deployment success on this run).
+    corr, corr_n = resolve_correlation(meta, points)
+    corr_str = f"{corr:.3f}" if corr is not None else "n/a"
+    fig.text(
+        0.5,
+        0.01,
+        f"Pearson r(val loss, steps-weighted success rate) = {corr_str} "
+        f"(n={corr_n})",
+        ha="center",
+        va="bottom",
+        fontsize=10,
+        color="#555555",
+    )
+
+    # Leave room at the bottom for the correlation annotation.
+    fig.tight_layout(rect=(0, 0.05, 1, 1))
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=150)
     print(f"Saved plot: {output}")
