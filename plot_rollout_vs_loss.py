@@ -149,14 +149,17 @@ def plot_rollout_vs_loss(
 
     # Annotate the val-loss vs steps-weighted-success-rate correlation at the
     # bottom of the figure (a strong negative r means val loss is a good
-    # model-selection proxy for deployment success on this run).
+    # model-selection proxy for deployment success on this run), alongside the
+    # best raw (unweighted) success rate achieved by any checkpoint.
     corr, corr_n = resolve_correlation(meta, points)
     corr_str = f"{corr:.3f}" if corr is not None else "n/a"
+    success_rates = [p.get("success_rate") for p in points if p.get("success_rate") is not None]
+    max_success_str = f"{max(success_rates):.3f}" if success_rates else "n/a"
     fig.text(
         0.5,
         0.01,
         f"Pearson r(val loss, steps-weighted success rate) = {corr_str} "
-        f"(n={corr_n})",
+        f"(n={corr_n})    |    max success rate = {max_success_str}",
         ha="center",
         va="bottom",
         fontsize=10,

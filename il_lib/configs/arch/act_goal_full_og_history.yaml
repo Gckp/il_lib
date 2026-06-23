@@ -1,30 +1,13 @@
 # @package _global_
 #
-# Observation-history variant of ``act_goal_full_og.yaml``.
-#
-# Identical to ``act_goal_full_og.yaml`` in every respect EXCEPT it feeds the
-# policy a short window of the most recent observation frames instead of a
-# single frame. This is the history counterpart used for ablating "does
-# temporal context help?" against the single-frame ``act_goal_full_og``
-# baseline -- keep the two files in sync if the baseline recipe changes.
-#
-# What ``num_latest_obs`` does for ACT (see ``il_lib.policies.ACT.forward``):
-#   * proprio: the L most-recent proprio vectors are flattened into a single
-#     transformer token of dim ``prop_dim * num_latest_obs``.
-#   * vision : each of the L frames is encoded by the (shared) ResNet and folded
-#     into the token/width axis, so the transformer attends over L frames worth
-#     of spatial tokens per view.
-# No change to the action chunk: ``num_queries``/``horizon`` still control the
-# predicted action sequence, so unlike diffusion there is no horizon-vs-history
-# length constraint here.
-#
-# ``num_latest_obs: 4`` ~= 0.4s of context at the 30 Hz control rate. Override
-# on the CLI to sweep the history length.
+# Observation-history variant of ``act_goal_full_og.yaml``: same recipe, but
+# num_latest_obs=8 frames (~0.7s at the dataset's 10Hz) instead of 1. Keep in
+# sync with the baseline if it changes.
 
 arch_name: act_goal_full_og_history
 
 # ====== Policy specific ======
-num_latest_obs: 4
+num_latest_obs: 8
 horizon: 60
 deployed_action_steps: 1  # change to ${horizon} if temporal ensemble is off
 lr: 1.0e-5
@@ -68,8 +51,6 @@ module:
     position_embedding: sine
     hidden_dim: ${module.hidden_dim}
   num_queries: ${horizon}
-  # Observation history: fold the L most-recent frames into proprio/vision
-  # tokens (see header). Wired from the top-level ``num_latest_obs``.
   num_latest_obs: ${num_latest_obs}
   hidden_dim: 512
   dropout: 0.1
