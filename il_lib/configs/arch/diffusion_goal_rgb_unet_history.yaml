@@ -14,7 +14,12 @@ num_latest_obs: 8
 deployed_action_steps: 8
 lr: 1.0e-4
 wd: 1.0e-6
-bs: 64
+# The feature extractor flattens obs to (bs * num_latest_obs) images per view
+# before ResNet18, so num_latest_obs=8 pushes 4x the activations of the
+# baseline (num_latest_obs=2). bs=16 keeps 16*8=128 images/view -- same as the
+# baseline's 64*2 -- so it fits in 24GB. accumulate_grad_batches restores the
+# effective batch of 64.
+bs: 16
 
 # ====== Policy Module ======
 module:
@@ -127,3 +132,8 @@ data:
   # RGB-only to match the goal-image pipeline.
   visual_obs_types: [rgb]
   use_task_info: false
+
+# Accumulate 4 micro-batches of bs=16 to keep the effective batch at 64,
+# matching the baseline recipe despite the smaller per-step batch above.
+trainer:
+  accumulate_grad_batches: 4
